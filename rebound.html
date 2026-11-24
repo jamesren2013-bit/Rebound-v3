@@ -1,0 +1,2500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>rebound v2</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      user-select: none;
+      -webkit-user-select: none;
+      font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    canvas {
+      display: block;
+      width: min(calc(100vw - 36px), calc((100vh - 36px) * (960 / 760)), 960px);
+      height: auto;
+      aspect-ratio: 960 / 760;
+      border: 2px solid #2e2e2e;
+      border-radius: 6px;
+      box-shadow: 0 0 42px rgba(0, 0, 0, 0.95);
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <script>
+    // Randomized splash text chosen once on page load
+    const SPLASHES = ['milk', 'ez', 'gg', 'skill issue', 'rebound', 'one more', 'lock in', 'cracked'];
+    const SPLASH = `'${SPLASHES[(Math.random() * SPLASHES.length) | 0]}'`;
+
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const W = 960, H = 760;
+    let lastTime = 0, elapsed = 0;
+
+    // Game State Machine ('MENU' | 'SKINS' | 'UPGRADES' | 'GAME' | 'GAMEOVER') & Cross-Fade
+    let state = 'MENU', fade = 0, fadeDir = 0, nextState = 'MENU';
+    let tutorialActive = true, timeScale = 1, spawnTimer = 0;
+    let maxHp = 100, hp = 100, displayHp = 100, score = 0, highScore = 0, isNewHigh = false;
+    let kills = 0, cash = 0, displayCash = 0, runEarned = 0, level = 1, levelXp = 0, shake = 0;
+
+    // Chain-Hit Combo & XP Multiplier State (base max combo = 4, upgradable up to 10)
+    const COMBO_WINDOW = 2.6;
+    let comboCount = 0, comboTimer = 0, maxComboMult = 1;
+    const comboSpring = { s: 1, v: 0, hover: 0, phase: 0 };
+
+    // Two-Page Upgrades Catalog (Page 0: ESSENTIALS, Page 1: ELITE — 6 ranks per card)
+    const UPGRADES = [
+      {
+        id: 'combo',
+        page: 0,
+        label: 'MAX COMBO',
+        rank: 0,
+        costs: [1500, 3800, 8500, 18000, 36000, 72000],
+        caps: [4, 5, 6, 7, 8, 9, 10],
+        lore: '-push your streak beyond mortal limits-',
+        statText: r => r >= 6
+          ? 'MAX: 10 COMBO (3.25x XP)'
+          : `MAX COMBO: ${[4, 5, 6, 7, 8, 9, 10][r]}  ->  ${[4, 5, 6, 7, 8, 9, 10][r + 1]}`
+      },
+      {
+        id: 'slomo',
+        page: 0,
+        label: 'MORE SLO-MO',
+        rank: 0,
+        costs: [2000, 5000, 11500, 25000, 52000, 110000],
+        durations: [2.2, 3.0, 4.0, 5.2, 6.8, 9.0, Infinity],
+        cooldowns: [1.0, 0.8, 0.6, 0.4, 0.2, 0.05, 0],
+        lore: '-bend the flow of time to your will-',
+        statText: r => {
+          if (r >= 6) return 'UNLIMITED SLO-MO (NO TIMER / 0s CD)';
+          if (r === 5) return '9.0s / 0.05s CD  ->  UNLIMITED SLO-MO';
+          const d = [2.2, 3.0, 4.0, 5.2, 6.8, 9.0];
+          const c = [1.0, 0.8, 0.6, 0.4, 0.2, 0.05];
+          return `${d[r].toFixed(1)}s (${c[r]}s CD)  ->  ${d[r + 1].toFixed(1)}s (${c[r + 1]}s CD)`;
+        }
+      },
+      {
+        id: 'health',
+        page: 0,
+        label: 'MORE HEALTH',
+        rank: 0,
+        costs: [1200, 3000, 7000, 15000, 32000, 65000],
+        values: [100, 120, 140, 160, 180, 200, 250],
+        lore: '-fortify your core against falling chaos-',
+        statText: r => r >= 6
+          ? 'MAX HEALTH: 250 HP'
+          : `MAX HP: ${[100, 120, 140, 160, 180, 200, 250][r]}  ->  ${[100, 120, 140, 160, 180, 200, 250][r + 1]}`
+      },
+      {
+        id: 'orbital',
+        page: 1,
+        label: 'ORBITAL STRIKES',
+        rank: 0,
+        costs: [12000, 18500, 26000, 35000, 46000, 60000],
+        counts: [0, 1, 2, 3, 4, 5, 6],
+        lore: '-twin-plated sentinel moons guarding your orbit-',
+        statText: r => r >= 6
+          ? '6 ORBITALS (2 HP EACH, AUTO-RECHARGE)'
+          : `ORBITALS: ${r}  ->  ${r + 1} (2 HP EACH)`
+      },
+      {
+        id: 'echos',
+        page: 1,
+        label: 'DEADLY ECHOS',
+        rank: 0,
+        costs: [13000, 19500, 27500, 37000, 48000, 62000],
+        counts: [0, 1, 2, 3, 4, 5, 6],
+        durations: [0, 0.65, 0.85, 1.05, 1.25, 1.45, 1.65],
+        lore: '-echoes from another dimension, repeating unseen destinies-',
+        statText: r => r >= 6
+          ? '6 LETHAL ECHOS (1.65s LIFETIME)'
+          : `ECHOS: ${r}  ->  ${r + 1} (${[0, 0.65, 0.85, 1.05, 1.25, 1.45, 1.65][r + 1].toFixed(2)}s)`
+      },
+      {
+        id: 'blackhole',
+        page: 1,
+        label: 'BLACK HOLE',
+        rank: 0,
+        costs: [14000, 21000, 29000, 39000, 51000, 65000],
+        radii: [0, 135, 165, 195, 225, 255, 285],
+        pulls: [0, 420, 560, 710, 870, 1040, 1220],
+        lore: '-collapse nearby matter into your flight path-',
+        statText: r => r >= 6
+          ? 'SINGULARITY: 285px RADIUS / MAX PULL'
+          : `PULL RADIUS: ${[0, 135, 165, 195, 225, 255, 285][r]}px  ->  ${[0, 135, 165, 195, 225, 255, 285][r + 1]}px`
+      }
+    ];
+    let upgradePage = 0, selectedUpgrade = 0;
+
+    // Clean Upgrades Screen Animation States
+    const cardFocus = [1, 0, 0, 1, 0, 0];
+    const cardPunch = [0, 0, 0, 0, 0, 0];
+    const pipPop = Array.from({ length: 6 }, () => [0, 0, 0, 0, 0, 0]);
+    let upgradeCursorX = W * 0.5 - 152 * 0.94;
+    let upgradePageSlide = 0;
+    let upgradeEnterT = 0;
+    let upgradeTitlePop = 0;
+    let buyShakeT = 0;
+
+    function triggerUpgradeScreenEnter() {
+      upgradeEnterT = 0;
+      upgradePageSlide = 0;
+      upgradeTitlePop = 1;
+      displayCash = cash;
+      const sc = 0.94;
+      upgradeCursorX = W * 0.5 + ((selectedUpgrade % 3) - 1) * 152 * sc;
+      for (let i = 0; i < 6; i++) {
+        cardFocus[i] = i === selectedUpgrade ? 1 : 0;
+        cardPunch[i] = 0;
+      }
+    }
+
+    function switchUpgradePage(dir) {
+      upgradePage = (upgradePage + 1) % 2;
+      selectedUpgrade = upgradePage * 3 + (selectedUpgrade % 3);
+      upgradePageSlide = dir * 135;
+      upgradeTitlePop = 1;
+      const sc = 0.94;
+      upgradeCursorX = W * 0.5 + ((selectedUpgrade % 3) - 1) * 152 * sc;
+      for (let i = 0; i < 3; i++) {
+        const idx = upgradePage * 3 + i;
+        cardPunch[idx] = 0.08 * (i + 1) * 0.4;
+      }
+    }
+
+    function selectUpgradeCard(idx) {
+      if (selectedUpgrade !== idx) {
+        selectedUpgrade = idx;
+        cardPunch[idx] = 0.18;
+      } else {
+        cardPunch[idx] = 0.12;
+      }
+    }
+
+    function formatCash(amount) {
+      return `$${Math.round(amount).toLocaleString('en-US')}`;
+    }
+
+    function getMaxComboCap() { return UPGRADES[0].caps[UPGRADES[0].rank]; }
+    function getSlomoDuration() { return UPGRADES[1].durations[UPGRADES[1].rank]; }
+    function getSlomoCooldown() { return UPGRADES[1].cooldowns[UPGRADES[1].rank]; }
+    function isSlomoUnlimited() { return UPGRADES[1].rank >= 6; }
+    function getMaxHealthValue() { return UPGRADES[2].values[UPGRADES[2].rank]; }
+    function getOrbitalCount() { return UPGRADES[3].counts[UPGRADES[3].rank]; }
+    function getEchoCount() { return UPGRADES[4].counts[UPGRADES[4].rank]; }
+    function getEchoDuration() { return UPGRADES[4].durations[UPGRADES[4].rank]; }
+    function getBlackHoleRadius() { return UPGRADES[5].radii[UPGRADES[5].rank]; }
+    function getBlackHolePull() { return UPGRADES[5].pulls[UPGRADES[5].rank]; }
+
+    // Skin Catalog & Selection Carousel State
+    const SKINS = [
+      { id: 0, name: 'ball',        reqLevel: 1,  desc: 'A BALL.' },
+      { id: 1, name: 'pink ball',   reqLevel: 5,  desc: 'A PINK BALL.' },
+      { id: 2, name: 'baseball',    reqLevel: 10, desc: 'BATTER UP.' },
+      { id: 3, name: 'basketball',  reqLevel: 15, desc: 'NOTHING BUT NET.' },
+      { id: 4, name: 'soccer ball', reqLevel: 20, desc: 'WORLD CLASS.' },
+      { id: 5, name: 'lock',        reqLevel: 25, desc: 'LOCKED IN.' },
+      { id: 6, name: 'creeper',     reqLevel: 30, desc: 'AW MAN.' }
+    ];
+    let equippedSkin = 0, selectedSkin = 0, carouselPos = 0;
+
+    // Quadratic XP-to-level progression curve
+    function getRequiredXp(lvl) {
+      return Math.round(600 + Math.pow(lvl - 1, 1.55) * 420);
+    }
+
+    function addPlayerXp(amount) {
+      if (amount <= 0) return;
+      levelXp += amount;
+      while (levelXp >= getRequiredXp(level)) {
+        levelXp -= getRequiredXp(level);
+        level++;
+      }
+    }
+
+    function getComboMultiplier(count) {
+      const capped = Math.min(getMaxComboCap(), count);
+      if (capped <= 1) return 1;
+      return Number((1 + (capped - 1) * 0.25).toFixed(2));
+    }
+
+    // Slo-Mo Duration Timer & Cooldown State
+    let isSlomo = false, slomoEnergy = 2.2, slomoCooldown = 0;
+
+    // Underdamped Second-Order Spring Physics for Arcade UI Buttons
+    const ptr = { x: -999, y: -999, down: false };
+    const makeSpring = () => ({ s: 1, v: 0, hover: 0, phase: 0 });
+    const menuSprings = Array.from({ length: 7 }, makeSpring);
+    const skinSprings = Array.from({ length: 2 }, makeSpring);
+    const upgSprings = Array.from({ length: 4 }, makeSpring); // 0=BACK, 1='<', 2='>', 3=BUY
+    const goSprings = Array.from({ length: 2 }, makeSpring);
+
+    function stepArcadeSpring(sp, hovered, targetScale, dt) {
+      const stiffness = 420;
+      const damping = 17;
+      const target = hovered ? targetScale : 1;
+      sp.v += ((target - sp.s) * stiffness - sp.v * damping) * dt;
+      sp.s += sp.v * dt;
+      const blendRate = 1 - Math.exp(-18 * dt);
+      sp.hover += ((hovered ? 1 : 0) - sp.hover) * blendRate;
+      if (sp.hover > 0.01) {
+        sp.phase += dt;
+      } else {
+        sp.phase = 0;
+      }
+    }
+
+    // Player Orb State
+    const player = { x: W * 0.5, y: H * 0.65, vx: 180, vy: -220, r: 44, stretch: 0, angle: 0 };
+
+    // Zero-Allocation Object Pools
+    const TRAIL_MAX = 36;
+    const trail = Array.from({ length: TRAIL_MAX }, () => ({ active: false, x: 0, y: 0, r: 17.5, alpha: 0 }));
+    let trailTimer = 0;
+
+    const ORBITAL_MAX = 6;
+    const orbitals = Array.from({ length: ORBITAL_MAX }, () => ({
+      active: false, hp: 2, maxHp: 2, recharge: 0, x: 0, y: 0, r: 13
+    }));
+    let orbitalAngle = 0;
+
+    const ECHO_MAX = 18;
+    const echos = Array.from({ length: ECHO_MAX }, () => ({
+      active: false, x: 0, y: 0, r: 28, life: 0, maxLife: 1.0
+    }));
+    let echoSpawnTimer = 0;
+
+    const POOL_SIZE = 12;
+    const pool = Array.from({ length: POOL_SIZE }, () => ({ active: false, type: 0, x: 0, y: 0, vx: 0, vy: 0, r: 48, a: 0, va: 0 }));
+
+    const ENEMY_MAX = 28;
+    const enemies = Array.from({ length: ENEMY_MAX }, () => ({ active: false, type: 0, x: 0, y: 0, vy: 0, r: 41, a: 0, va: 0 }));
+
+    const PARTICLE_MAX = 180;
+    const parts = Array.from({ length: PARTICLE_MAX }, () => ({ active: false, x: 0, y: 0, vx: 0, vy: 0, r: 6, life: 0, maxLife: 0.4, color: '#fff' }));
+
+    const FLOAT_MAX = 24;
+    const floats = Array.from({ length: FLOAT_MAX }, () => ({
+      active: false, x: 0, y: 0, vy: -75, text: '', subText: '', color: '#ffffff', scale: 1, alpha: 1, life: 0, maxLife: 0.85
+    }));
+
+    function spawnFloatText(x, y, text, subText, color, scale = 1) {
+      for (let i = 0; i < FLOAT_MAX; i++) {
+        const f = floats[i];
+        if (f.active) continue;
+        f.active = true;
+        f.x = Math.max(70, Math.min(W - 70, x));
+        f.y = Math.max(70, Math.min(H - 50, y));
+        f.vy = -78 - Math.random() * 24;
+        f.text = text;
+        f.subText = subText;
+        f.color = color;
+        f.scale = scale;
+        f.alpha = 1;
+        f.maxLife = 0.88;
+        f.life = f.maxLife;
+        return;
+      }
+    }
+
+    function seedPool() {
+      const types = [0, 0, 0, 1, 1, 2, 2, 3, 0, 1, 2, 0];
+      for (let i = 0; i < POOL_SIZE; i++) {
+        const e = pool[i];
+        e.active = true;
+        e.type = types[i % types.length];
+        e.x = Math.random() * W;
+        e.y = Math.random() * H;
+        e.r = e.type === 1 ? 56 : (45 + Math.random() * 14);
+        const ang = Math.random() * Math.PI * 2;
+        const spd = 8 + Math.random() * 14;
+        e.vx = Math.cos(ang) * spd;
+        e.vy = Math.sin(ang) * spd;
+        e.a = Math.random() * Math.PI * 2;
+        e.va = (Math.random() - 0.5) * 0.28;
+      }
+    }
+
+    function spawnBurst(x, y, color, count) {
+      let spawned = 0;
+      for (let i = 0; i < PARTICLE_MAX && spawned < count; i++) {
+        const p = parts[i];
+        if (p.active) continue;
+        const ang = Math.random() * Math.PI * 2;
+        const spd = 110 + Math.random() * 340;
+        p.active = true;
+        p.x = x;
+        p.y = y;
+        p.vx = Math.cos(ang) * spd;
+        p.vy = Math.sin(ang) * spd;
+        p.r = 5 + Math.random() * 6;
+        p.maxLife = 0.28 + Math.random() * 0.22;
+        p.life = p.maxLife;
+        p.color = color;
+        spawned++;
+      }
+    }
+
+    function spawnShopBurst(x, y, color, count) {
+      let spawned = 0;
+      for (let i = 0; i < PARTICLE_MAX && spawned < count; i++) {
+        const p = parts[i];
+        if (p.active) continue;
+        const ang = Math.random() * Math.PI * 2;
+        const spd = 70 + Math.random() * 210;
+        p.active = true;
+        p.x = x;
+        p.y = y;
+        p.vx = Math.cos(ang) * spd;
+        p.vy = Math.sin(ang) * spd - 45;
+        p.r = 3.5 + Math.random() * 4;
+        p.maxLife = 0.42 + Math.random() * 0.24;
+        p.life = p.maxLife;
+        p.color = color;
+        spawned++;
+      }
+    }
+
+    // High-DPI Backing Buffer Setup
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+    }
+    window.addEventListener('resize', resize);
+    resize();
+    seedPool();
+
+    function updatePointer(e) {
+      const rect = canvas.getBoundingClientRect();
+      ptr.x = ((e.clientX - rect.left) / rect.width) * W;
+      ptr.y = ((e.clientY - rect.top) / rect.height) * H;
+    }
+
+    canvas.addEventListener('pointermove', updatePointer);
+
+    canvas.addEventListener('pointerdown', e => {
+      if (e.button !== 0) return;
+      updatePointer(e);
+      ptr.down = true;
+      const sc = 0.94;
+
+      if (state === 'MENU' && fadeDir === 0) {
+        const bW = 196 * sc, bH = 66 * sc, gap = 24 * sc, topY = H * 0.5 - 42 * sc;
+        if (Math.abs(ptr.x - W * 0.5) <= bW * 0.58 && ptr.y >= topY && ptr.y <= topY + bH) {
+          startFade('GAME');
+        } else if (Math.abs(ptr.x - W * 0.5) <= bW * 0.58 && Math.abs(ptr.y - (topY + bH + gap + bH * 0.5)) <= bH * 0.58) {
+          selectedSkin = equippedSkin;
+          carouselPos = equippedSkin;
+          startFade('SKINS');
+        } else if (Math.abs(ptr.x - W * 0.5) <= bW * 0.58 && Math.abs(ptr.y - (topY + 2 * (bH + gap) + bH * 0.5)) <= bH * 0.58) {
+          startFade('UPGRADES');
+        }
+      } else if (state === 'SKINS' && fadeDir === 0) {
+        if (ptr.x >= 10 && ptr.x <= 246 && ptr.y >= 12 && ptr.y <= 116) {
+          startFade('MENU');
+          return;
+        }
+        const actY = H * 0.5 + 148 * sc;
+        if (Math.abs(ptr.x - W * 0.5) <= 112 * sc && Math.abs(ptr.y - actY) <= 34 * sc) {
+          const sk = SKINS[selectedSkin];
+          if (level >= sk.reqLevel) {
+            equippedSkin = sk.id;
+          }
+          return;
+        }
+        const orbY = H * 0.5 - 16 * sc;
+        for (let i = 0; i < SKINS.length; i++) {
+          const offset = i - carouselPos;
+          if (Math.abs(offset) < 0.35) continue;
+          const ix = W * 0.5 + offset * 175 * sc;
+          if (Math.hypot(ptr.x - ix, ptr.y - orbY) <= 58 * sc) {
+            selectedSkin = i;
+            return;
+          }
+        }
+      } else if (state === 'UPGRADES' && fadeDir === 0) {
+        if (ptr.x >= 10 && ptr.x <= 246 && ptr.y >= 12 && ptr.y <= 116) {
+          startFade('MENU');
+          return;
+        }
+        const arrowY = H * 0.5 + 4 * sc;
+        if (Math.abs(ptr.x - (W * 0.5 - 356 * sc)) <= 34 * sc && Math.abs(ptr.y - arrowY) <= 46 * sc) {
+          switchUpgradePage(-1);
+          return;
+        }
+        if (Math.abs(ptr.x - (W * 0.5 + 356 * sc)) <= 34 * sc && Math.abs(ptr.y - arrowY) <= 46 * sc) {
+          switchUpgradePage(1);
+          return;
+        }
+        const cardY = H * 0.5 - 2 * sc, cardSpacing = 152 * sc, cardSize = 108 * sc;
+        for (let i = 0; i < 3; i++) {
+          const cxCard = W * 0.5 + (i - 1) * cardSpacing;
+          if (Math.abs(ptr.x - cxCard) <= cardSize * 0.62 && Math.abs(ptr.y - cardY) <= cardSize * 0.72) {
+            selectUpgradeCard(upgradePage * 3 + i);
+            return;
+          }
+        }
+        const buyY = H * 0.5 + 278 * sc, buyW = 248 * sc, buyH = 74 * sc;
+        if (Math.abs(ptr.x - W * 0.5) <= buyW * 0.58 && Math.abs(ptr.y - buyY) <= buyH * 0.58) {
+          const u = UPGRADES[selectedUpgrade];
+          if (u.rank < 6) {
+            const cost = u.costs[u.rank];
+            if (cash >= cost) {
+              cash -= cost;
+              const unlockedPip = u.rank;
+              u.rank++;
+              maxHp = getMaxHealthValue();
+              pipPop[selectedUpgrade][unlockedPip] = 1;
+              cardPunch[selectedUpgrade] = 0.28;
+              upgSprings[3].s = 1.32;
+              upgSprings[3].v = 4.0;
+              const slotIdx = selectedUpgrade % 3;
+              const burstX = W * 0.5 + (slotIdx - 1) * 152 * sc;
+              const burstY = H * 0.5 - 16 * sc;
+              spawnShopBurst(burstX, burstY, upgradePage === 1 ? '#f6ee7e' : '#66ff66', 22);
+            } else {
+              buyShakeT = 0.36;
+            }
+          }
+          return;
+        }
+      } else if (state === 'GAME') {
+        if (tutorialActive) tutorialActive = false;
+        if (isSlomoUnlimited() || (slomoCooldown <= 0 && slomoEnergy > 0.08)) {
+          isSlomo = true;
+        }
+      } else if (state === 'GAMEOVER' && fadeDir === 0) {
+        const bW = 196 * sc, bH = 66 * sc, gap = 20 * sc, topY = H * 0.5 + 118 * sc;
+        if (Math.abs(ptr.x - W * 0.5) <= bW * 0.58 && Math.abs(ptr.y - (topY + bH * 0.5)) <= bH * 0.58) {
+          startFade('GAME');
+        } else if (Math.abs(ptr.x - W * 0.5) <= bW * 0.58 && Math.abs(ptr.y - (topY + bH + gap + bH * 0.5)) <= bH * 0.58) {
+          startFade('UPGRADES');
+        }
+      }
+    });
+
+    function releaseSlomoLaunch() {
+      if (!isSlomo) return;
+      isSlomo = false;
+      slomoCooldown = isSlomoUnlimited() ? 0 : getSlomoCooldown();
+      const dx = ptr.x - player.x;
+      const dy = ptr.y - player.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 6) {
+        const power = Math.min(1, dist / 280);
+        const speed = 560 + power * 1160;
+        player.vx = (dx / dist) * speed;
+        player.vy = (dy / dist) * speed;
+      }
+    }
+
+    window.addEventListener('pointerup', e => {
+      if (e.button !== 0) return;
+      if (state === 'GAME' && isSlomo) {
+        releaseSlomoLaunch();
+      }
+      ptr.down = false;
+    });
+
+    window.addEventListener('keydown', e => {
+      if (e.code === 'Space' && state === 'GAME' && tutorialActive) {
+        e.preventDefault();
+        tutorialActive = false;
+      } else if (state === 'SKINS') {
+        if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+          selectedSkin = Math.min(SKINS.length - 1, selectedSkin + 1);
+        } else if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+          selectedSkin = Math.max(0, selectedSkin - 1);
+        } else if (e.code === 'Escape') {
+          startFade('MENU');
+        }
+      } else if (state === 'UPGRADES') {
+        if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+          switchUpgradePage(1);
+        } else if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+          switchUpgradePage(-1);
+        } else if (e.code === 'Digit1') {
+          selectUpgradeCard(upgradePage * 3);
+        } else if (e.code === 'Digit2') {
+          selectUpgradeCard(upgradePage * 3 + 1);
+        } else if (e.code === 'Digit3') {
+          selectUpgradeCard(upgradePage * 3 + 2);
+        } else if (e.code === 'Escape') {
+          startFade('MENU');
+        }
+      }
+    });
+
+    function startFade(target) {
+      if (fadeDir !== 0) return;
+      nextState = target;
+      fadeDir = 1;
+    }
+
+    function startGame() {
+      maxHp = getMaxHealthValue();
+      hp = maxHp;
+      displayHp = maxHp;
+      score = 0;
+      kills = 0;
+      runEarned = 0;
+      isNewHigh = false;
+      shake = 0;
+      spawnTimer = 0.4;
+      tutorialActive = true;
+      timeScale = 1;
+      trailTimer = 0;
+      isSlomo = false;
+      slomoEnergy = isSlomoUnlimited() ? 1 : getSlomoDuration();
+      slomoCooldown = 0;
+      comboCount = 0;
+      comboTimer = 0;
+      maxComboMult = 1;
+      comboSpring.s = 1;
+      comboSpring.v = 0;
+      comboSpring.hover = 0;
+      comboSpring.phase = 0;
+      player.x = W * 0.56;
+      player.y = H * 0.68;
+      player.vx = (Math.random() < 0.5 ? -1 : 1) * 230;
+      player.vy = -290;
+      player.stretch = 0;
+
+      for (let i = 0; i < ENEMY_MAX; i++) enemies[i].active = false;
+      for (let i = 0; i < PARTICLE_MAX; i++) parts[i].active = false;
+      for (let i = 0; i < TRAIL_MAX; i++) trail[i].active = false;
+      for (let i = 0; i < FLOAT_MAX; i++) floats[i].active = false;
+      for (let i = 0; i < ECHO_MAX; i++) echos[i].active = false;
+      echoSpawnTimer = 0;
+      orbitalAngle = 0;
+
+      const orbCount = getOrbitalCount();
+      for (let i = 0; i < ORBITAL_MAX; i++) {
+        const o = orbitals[i];
+        o.active = i < orbCount;
+        o.hp = 2;
+        o.maxHp = 2;
+        o.recharge = 0;
+        o.x = player.x;
+        o.y = player.y;
+      }
+    }
+
+    function triggerGameOver() {
+      if (fadeDir !== 0) return;
+      if (score > highScore) {
+        highScore = score;
+        isNewHigh = true;
+      }
+      runEarned = score + kills;
+      cash += runEarned;
+      addPlayerXp(kills);
+      seedPool();
+      startFade('GAMEOVER');
+    }
+
+    function spawnEnemy(avoidX = null) {
+      for (let i = 0; i < ENEMY_MAX; i++) {
+        const e = enemies[i];
+        if (e.active) continue;
+        const roll = Math.random();
+        e.type = roll < 0.50 ? 0 : roll < 0.72 ? 1 : roll < 0.80 ? 2 : 3;
+        e.r = e.type === 3 ? 48 : (e.type === 2 ? 33 : 41);
+        const minX = e.r + 24;
+        const maxX = W - (e.r + 24);
+        let candidateX = minX + Math.random() * (maxX - minX);
+        // Ensure twin balls in the same wave spawn at least 110px apart horizontally
+        if (avoidX !== null) {
+          for (let attempt = 0; attempt < 12; attempt++) {
+            if (Math.abs(candidateX - avoidX) >= 110) break;
+            candidateX = minX + Math.random() * (maxX - minX);
+          }
+          if (Math.abs(candidateX - avoidX) < 110) {
+            candidateX = avoidX < W * 0.5
+              ? Math.min(maxX, avoidX + 130)
+              : Math.max(minX, avoidX - 130);
+          }
+        }
+        e.x = candidateX;
+        e.y = -e.r - 12;
+        e.vy = (175 + Math.random() * 115) * (1 + Math.min(0.85, score / 4500));
+        e.a = Math.random() * Math.PI * 2;
+        e.va = (Math.random() - 0.5) * 1.4;
+        e.active = true;
+        return e.x;
+      }
+      return null;
+    }
+
+    // Spawns 2 horizontally separated falling balls per wave
+    function spawnWave() {
+      const firstX = spawnEnemy(null);
+      spawnEnemy(firstX);
+    }
+
+    // Reusable N-point star polygon path
+    function drawStar(outerR, innerR, points) {
+      ctx.beginPath();
+      for (let i = 0; i < points * 2; i++) {
+        const r = i % 2 === 0 ? outerR : innerR;
+        const a = (i * Math.PI) / points - Math.PI / 2;
+        i === 0 ? ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r) : ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    function drawPadlockIcon(r, labelText) {
+      const bw = r * 0.94, bh = r * 0.80, by = r * 0.04;
+      const shackleR = r * 0.27;
+      ctx.save();
+      ctx.strokeStyle = '#080808';
+      ctx.lineWidth = r * 0.14;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.arc(0, by - r * 0.34, shackleR, Math.PI, 0, false);
+      ctx.moveTo(-shackleR, by - r * 0.34);
+      ctx.lineTo(-shackleR, by + r * 0.02);
+      ctx.moveTo(shackleR, by - r * 0.34);
+      ctx.lineTo(shackleR, by + r * 0.02);
+      ctx.stroke();
+
+      ctx.fillStyle = '#080808';
+      ctx.beginPath();
+      ctx.roundRect(-bw * 0.5, by, bw, bh, r * 0.16);
+      ctx.fill();
+
+      if (labelText) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `700 ${Math.round(r * 0.29)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(labelText, 0, by + bh * 0.52);
+      }
+      ctx.restore();
+    }
+
+    // Procedural Skin Renderer (0: ball, 1: pink, 2: baseball, 3: basketball, 4: soccer, 5: lock, 6: creeper)
+    function drawSkin(skinId, r, isLockedPreview = false, reqLvl = 1) {
+      if (isLockedPreview) {
+        ctx.save();
+        ctx.fillStyle = '#a8aeb2';
+        ctx.shadowColor = 'rgba(255,255,255,0.28)';
+        ctx.shadowBlur = r * 0.42;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        drawPadlockIcon(r, `lvl ${reqLvl}`);
+        ctx.restore();
+        return;
+      }
+
+      ctx.save();
+      const glowColors = [
+        'rgba(85,214,255,0.34)',
+        'rgba(255,105,180,0.34)',
+        'rgba(245,245,245,0.24)',
+        'rgba(255,132,36,0.32)',
+        'rgba(245,245,245,0.24)',
+        'rgba(185,192,198,0.28)',
+        'rgba(92,232,76,0.36)'
+      ];
+      const halo = ctx.createRadialGradient(0, 0, r * 0.65, 0, 0, r * 1.9);
+      halo.addColorStop(0, glowColors[skinId] || glowColors[0]);
+      halo.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = halo;
+      ctx.beginPath();
+      ctx.arc(0, 0, r * 1.9, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (skinId === 0) {
+        ctx.fillStyle = '#55d6ff';
+        ctx.shadowColor = 'rgba(85,214,255,0.65)';
+        ctx.shadowBlur = r * 0.45;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (skinId === 1) {
+        ctx.fillStyle = '#ff66b8';
+        ctx.shadowColor = 'rgba(255,102,184,0.65)';
+        ctx.shadowBlur = r * 0.45;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (skinId === 2) {
+        ctx.fillStyle = '#f6f6f6';
+        ctx.shadowColor = 'rgba(255,255,255,0.35)';
+        ctx.shadowBlur = r * 0.35;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.clip();
+
+        ctx.strokeStyle = '#d9383a';
+        ctx.lineWidth = Math.max(2, r * 0.065);
+        [-1, 1].forEach(side => {
+          ctx.beginPath();
+          ctx.arc(side * r * 1.12, 0, r * 0.78, side < 0 ? -0.82 : Math.PI - 0.82, side < 0 ? 0.82 : Math.PI + 0.82);
+          ctx.stroke();
+
+          ctx.lineWidth = Math.max(1.6, r * 0.045);
+          for (let a = -0.66; a <= 0.66; a += 0.22) {
+            const ang = side < 0 ? a : Math.PI + a;
+            const sx = side * r * 1.12 + Math.cos(ang) * r * 0.78;
+            const sy = Math.sin(ang) * r * 0.78;
+            ctx.beginPath();
+            ctx.moveTo(sx - r * 0.07, sy - r * 0.05);
+            ctx.lineTo(sx + r * 0.07, sy + r * 0.05);
+            ctx.stroke();
+          }
+          ctx.lineWidth = Math.max(2, r * 0.065);
+        });
+      } else if (skinId === 3) {
+        ctx.fillStyle = '#f37b24';
+        ctx.shadowColor = 'rgba(243,123,36,0.45)';
+        ctx.shadowBlur = r * 0.38;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.clip();
+
+        ctx.strokeStyle = '#1f140d';
+        ctx.lineWidth = Math.max(2.2, r * 0.07);
+        ctx.beginPath();
+        ctx.moveTo(-r, 0);
+        ctx.lineTo(r, 0);
+        ctx.moveTo(0, -r);
+        ctx.lineTo(0, r);
+        ctx.stroke();
+
+        [-1, 1].forEach(side => {
+          ctx.beginPath();
+          ctx.arc(side * r * 1.16, 0, r * 0.82, side < 0 ? -0.85 : Math.PI - 0.85, side < 0 ? 0.85 : Math.PI + 0.85);
+          ctx.stroke();
+        });
+      } else if (skinId === 4) {
+        ctx.fillStyle = '#f5f5f5';
+        ctx.shadowColor = 'rgba(255,255,255,0.35)';
+        ctx.shadowBlur = r * 0.35;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.clip();
+
+        ctx.fillStyle = '#181818';
+        ctx.strokeStyle = '#181818';
+        ctx.lineWidth = Math.max(2, r * 0.055);
+        const pentR = r * 0.38;
+        ctx.beginPath();
+        for (let i = 0; i < 5; i++) {
+          const a = (i * Math.PI * 2) / 5 - Math.PI / 2;
+          const px = Math.cos(a) * pentR, py = Math.sin(a) * pentR;
+          i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        for (let i = 0; i < 5; i++) {
+          const a = (i * Math.PI * 2) / 5 - Math.PI / 2;
+          ctx.beginPath();
+          ctx.moveTo(Math.cos(a) * pentR, Math.sin(a) * pentR);
+          ctx.lineTo(Math.cos(a) * r * 0.78, Math.sin(a) * r * 0.78);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(Math.cos(a) * r * 0.96, Math.sin(a) * r * 0.96, r * 0.28, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (skinId === 5) {
+        ctx.fillStyle = '#b7babe';
+        ctx.shadowColor = 'rgba(200,208,214,0.45)';
+        ctx.shadowBlur = r * 0.42;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        drawPadlockIcon(r, null);
+      } else if (skinId === 6) {
+        ctx.fillStyle = '#57e849';
+        ctx.shadowColor = 'rgba(87,232,73,0.65)';
+        ctx.shadowBlur = r * 0.48;
+        drawStar(r * 1.15, r * 0.78, 10);
+        ctx.shadowBlur = 0;
+
+        const u = r * 0.145;
+        ctx.fillStyle = '#0c180a';
+        ctx.fillRect(-u * 2.5, -u * 2.1, u * 1.7, u * 1.7);
+        ctx.fillRect(u * 0.8, -u * 2.1, u * 1.7, u * 1.7);
+        ctx.fillRect(-u * 0.85, -u * 0.4, u * 1.7, u * 1.4);
+        ctx.fillRect(-u * 1.7, u * 0.4, u * 3.4, u * 1.3);
+        ctx.fillRect(-u * 1.7, u * 1.7, u * 1.1, u * 1.2);
+        ctx.fillRect(u * 0.6, u * 1.7, u * 1.1, u * 1.2);
+      }
+      ctx.restore();
+    }
+
+    // Shared Ambient Background Renderer
+    function renderAmbientBackground(dt) {
+      ctx.fillStyle = '#050505';
+      ctx.fillRect(0, 0, W, H);
+
+      const radialBg = ctx.createRadialGradient(W * 0.5, H * 0.42, 40, W * 0.5, H * 0.5, W * 0.62);
+      radialBg.addColorStop(0, 'rgba(18, 42, 48, 0.42)');
+      radialBg.addColorStop(0.55, 'rgba(8, 18, 22, 0.22)');
+      radialBg.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = radialBg;
+      ctx.fillRect(0, 0, W, H);
+
+      const cols = [
+        ['rgba(95,22,22,0.55)', 'rgba(95,22,22,0.22)', 22],
+        ['rgba(30,85,32,0.55)', 'rgba(30,85,32,0.22)', 20],
+        ['rgba(58,34,82,0.55)', 'rgba(58,34,82,0.22)', 22],
+        ['rgba(82,82,82,0.45)', 'rgba(72,72,72,0.28)', 22]
+      ];
+      for (let i = 0; i < POOL_SIZE; i++) {
+        const e = pool[i];
+        if (!e.active) continue;
+        e.x += e.vx * dt;
+        e.y += e.vy * dt;
+        e.a += e.va * dt;
+        const pad = e.r + 30;
+        if (e.x < -pad) e.x = W + pad;
+        else if (e.x > W + pad) e.x = -pad;
+        if (e.y < -pad) e.y = H + pad;
+        else if (e.y > H + pad) e.y = -pad;
+
+        ctx.save();
+        ctx.translate(e.x, e.y);
+        ctx.rotate(e.a);
+        const [glow, fill, blur] = cols[e.type];
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = blur;
+        ctx.fillStyle = fill;
+        if (e.type === 1) {
+          drawStar(e.r, e.r * 0.68, 10);
+        } else {
+          ctx.beginPath();
+          ctx.arc(0, 0, e.r, 0, Math.PI * 2);
+          ctx.fill();
+          if (e.type === 3) {
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = 'rgba(95,22,22,0.55)';
+            const cw = e.r * 0.22, cl = e.r * 0.56;
+            ctx.fillRect(-cw, -cl, cw * 2, cl * 2);
+            ctx.fillRect(-cl, -cw, cl * 2, cw * 2);
+          }
+        }
+        ctx.restore();
+      }
+    }
+
+    function renderMenu(dt) {
+      renderAmbientBackground(dt);
+      const cx = W * 0.5, cy = H * 0.5, sc = 0.94;
+
+      // Randomized splash text & giant glowing "lvl X" centerpiece above the hero orb
+      const bob = Math.sin(elapsed * 2.4) * 2.5 * sc;
+      ctx.save();
+      ctx.fillStyle = '#9e8f56';
+      ctx.font = `600 ${Math.round(25 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(SPLASH, cx, cy - 314 * sc + bob);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(85,214,255,0.48)';
+      ctx.shadowBlur = 22 * sc;
+      ctx.font = `900 ${Math.round(62 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(`lvl ${level}`, cx, cy - 262 * sc);
+
+      // Subtle glowing XP progress bar directly beneath the center "lvl X" readout
+      const xpBarW = 164 * sc, xpBarH = 7 * sc;
+      const xpBarX = cx - xpBarW * 0.5, xpBarY = cy - 224 * sc;
+      const xpFillRatio = Math.max(0, Math.min(1, levelXp / getRequiredXp(level)));
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255,255,255,0.14)';
+      ctx.beginPath();
+      ctx.roundRect(xpBarX, xpBarY, xpBarW, xpBarH, 4 * sc);
+      ctx.fill();
+      if (xpFillRatio > 0) {
+        ctx.fillStyle = '#f8f272';
+        ctx.shadowColor = 'rgba(248,242,114,0.75)';
+        ctx.shadowBlur = 10 * sc;
+        ctx.beginPath();
+        ctx.roundRect(xpBarX, xpBarY, Math.max(xpBarH, xpBarW * xpFillRatio), xpBarH, 4 * sc);
+        ctx.fill();
+      }
+      ctx.restore();
+
+      // Active equipped skin hero orb preview
+      const pulse = 1 + Math.sin(elapsed * 3.1) * 0.025;
+      const orbR = 56 * sc * pulse, orbY = cy - 134 * sc;
+      ctx.save();
+      ctx.translate(cx, orbY);
+      drawSkin(equippedSkin, orbR, false, 1);
+      ctx.restore();
+
+      // Menu buttons (PLAY, SKINS, UPGRADES) with aggressive arcade pop + left-to-right wave
+      const bW = 196 * sc, bH = 66 * sc, gap = 24 * sc, topY = cy - 42 * sc, stackH = bH * 3 + gap * 2;
+      const grad = ctx.createLinearGradient(cx, topY - 14 * sc, cx, topY + stackH + 14 * sc);
+      grad.addColorStop(0, 'rgba(28,28,28,0)');
+      grad.addColorStop(0.12, 'rgba(34,34,34,0.78)');
+      grad.addColorStop(0.5, 'rgba(26,26,26,0.85)');
+      grad.addColorStop(0.88, 'rgba(34,34,34,0.78)');
+      grad.addColorStop(1, 'rgba(28,28,28,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(cx - bW / 2, topY - 14 * sc, bW, stackH + 28 * sc);
+
+      [['PLAY', 40], ['SKINS', 38], ['UPGRADES', 28]].forEach(([label, fs], i) => {
+        const bcy = topY + i * (bH + gap) + bH * 0.5;
+        const sp = menuSprings[i];
+        const hitPad = sp.hover > 0.1 ? 1.16 : 1.0;
+        const hovered = Math.abs(ptr.x - cx) <= bW * 0.5 * hitPad && Math.abs(ptr.y - bcy) <= bH * 0.5 * hitPad;
+        stepArcadeSpring(sp, hovered, 1.26, dt);
+
+        const waveX = Math.sin(sp.phase * 15) * 11 * sc * sp.hover;
+        const tilt = Math.sin(sp.phase * 13) * 0.085 * sp.hover;
+
+        ctx.save();
+        ctx.translate(cx + waveX, bcy);
+        ctx.rotate(tilt);
+        ctx.scale(sp.s, sp.s);
+        ctx.shadowColor = sp.hover > 0.1 ? `rgba(255,255,255,${0.55 * sp.hover})` : 'rgba(0,0,0,0.65)';
+        ctx.shadowBlur = (10 + 16 * sp.hover) * sc;
+        ctx.shadowOffsetY = 3 * sc * (1 - sp.hover);
+        ctx.fillStyle = '#f8f8f8';
+        ctx.fillRect(-bW / 2, -bH / 2, bW, bH);
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.fillStyle = '#1b1b1b';
+        ctx.font = `800 ${Math.round(fs * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(label, 0, bH * 0.03);
+        ctx.restore();
+      });
+
+      // Right-side Gear & Trophy Podium badges
+      const rowY = topY + 2 * (bH + gap) + bH * 0.5;
+      const gx = cx - bW / 2 - 70 * sc;
+      const spGear = menuSprings[3];
+      const gearHover = Math.hypot(ptr.x - gx, ptr.y - rowY) <= 34 * sc;
+      stepArcadeSpring(spGear, gearHover, 1.32, dt);
+
+      ctx.save();
+      ctx.translate(gx + Math.sin(spGear.phase * 15) * 9 * sc * spGear.hover, rowY);
+      ctx.rotate(Math.sin(spGear.phase * 13) * 0.14 * spGear.hover);
+      ctx.scale(spGear.s, spGear.s);
+      if (spGear.hover > 0.05) {
+        ctx.shadowColor = `rgba(255,255,255,${0.75 * spGear.hover})`;
+        ctx.shadowBlur = 16 * sc * spGear.hover;
+      }
+      ctx.fillStyle = '#ffffff';
+      for (let t = 0; t < 8; t++) {
+        ctx.save();
+        ctx.rotate((t * Math.PI) / 4);
+        ctx.beginPath();
+        ctx.roundRect(-5 * sc, -26 * sc, 10 * sc, 10 * sc, 2 * sc);
+        ctx.fill();
+        ctx.restore();
+      }
+      ctx.beginPath();
+      ctx.arc(0, 0, 20 * sc, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#050505';
+      ctx.beginPath();
+      ctx.arc(0, 0, 7.5 * sc, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      const tx = cx + bW / 2 + 70 * sc;
+      const spTrophy = menuSprings[4];
+      const trophyHover = Math.hypot(ptr.x - tx, ptr.y - rowY) <= 36 * sc;
+      stepArcadeSpring(spTrophy, trophyHover, 1.32, dt);
+
+      ctx.save();
+      ctx.translate(tx + Math.sin(spTrophy.phase * 15) * 9 * sc * spTrophy.hover, rowY);
+      ctx.rotate(Math.sin(spTrophy.phase * 13) * 0.12 * spTrophy.hover);
+      ctx.scale(spTrophy.s, spTrophy.s);
+      if (spTrophy.hover > 0.05) {
+        ctx.shadowColor = `rgba(255,255,255,${0.75 * spTrophy.hover})`;
+        ctx.shadowBlur = 16 * sc * spTrophy.hover;
+      }
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.roundRect(-28 * sc, 6 * sc, 56 * sc, 18 * sc, 2 * sc);
+      ctx.roundRect(-16 * sc, -1 * sc, 32 * sc, 9 * sc, 2 * sc);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#050505';
+      ctx.save();
+      ctx.translate(0, 13.5 * sc);
+      drawStar(6.2 * sc, 2.7 * sc, 5);
+      ctx.restore();
+      if (spTrophy.hover > 0.05) {
+        ctx.shadowColor = `rgba(255,255,255,${0.75 * spTrophy.hover})`;
+        ctx.shadowBlur = 16 * sc * spTrophy.hover;
+      }
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(-8 * sc, -5 * sc, 16 * sc, 3 * sc);
+      ctx.fillRect(-2.2 * sc, -11 * sc, 4.4 * sc, 7 * sc);
+      ctx.beginPath();
+      ctx.moveTo(-10 * sc, -26 * sc);
+      ctx.lineTo(10 * sc, -26 * sc);
+      ctx.bezierCurveTo(10 * sc, -12 * sc, 3 * sc, -10 * sc, 0, -10 * sc);
+      ctx.bezierCurveTo(-3 * sc, -10 * sc, -10 * sc, -12 * sc, -10 * sc, -26 * sc);
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2.4 * sc;
+      [-1, 1].forEach(d => {
+        ctx.beginPath();
+        ctx.arc(d * 10 * sc, -20 * sc, 4.5 * sc, d < 0 ? Math.PI * 0.5 : -Math.PI * 0.5, d < 0 ? Math.PI * 1.5 : Math.PI * 0.5);
+        ctx.stroke();
+      });
+      ctx.restore();
+
+      // Glowing yellow "$cash" counter
+      ctx.save();
+      ctx.fillStyle = '#f8f272';
+      ctx.shadowColor = 'rgba(248,242,114,0.75)';
+      ctx.shadowBlur = 18 * sc;
+      ctx.font = `800 ${Math.round(52 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(formatCash(cash), cx, topY + stackH + 54 * sc);
+      ctx.restore();
+
+      // Bottom-left "?" and bottom-right Profile badges
+      const mx = Math.max(44, 52 * sc), my = H - Math.max(46, 54 * sc), r = 27 * sc;
+      const spHelp = menuSprings[5];
+      const helpHover = Math.hypot(ptr.x - mx, ptr.y - my) <= r * 1.25;
+      stepArcadeSpring(spHelp, helpHover, 1.32, dt);
+
+      ctx.save();
+      ctx.translate(mx + Math.sin(spHelp.phase * 15) * 8 * sc * spHelp.hover, my);
+      ctx.rotate(Math.sin(spHelp.phase * 13) * 0.13 * spHelp.hover);
+      ctx.scale(spHelp.s, spHelp.s);
+      if (spHelp.hover > 0.05) {
+        ctx.shadowColor = `rgba(255,255,255,${0.75 * spHelp.hover})`;
+        ctx.shadowBlur = 16 * sc * spHelp.hover;
+      }
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+      ctx.lineWidth = 2.6 * sc;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.font = `500 ${Math.round(42 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText('?', 0, 2 * sc);
+      ctx.restore();
+
+      const spProf = menuSprings[6];
+      const profHover = Math.hypot(ptr.x - (W - mx), ptr.y - my) <= r * 1.25;
+      stepArcadeSpring(spProf, profHover, 1.32, dt);
+
+      ctx.save();
+      ctx.translate(W - mx + Math.sin(spProf.phase * 15) * 8 * sc * spProf.hover, my);
+      ctx.rotate(Math.sin(spProf.phase * 13) * 0.13 * spProf.hover);
+      ctx.scale(spProf.s, spProf.s);
+      if (spProf.hover > 0.05) {
+        ctx.shadowColor = `rgba(255,255,255,${0.75 * spProf.hover})`;
+        ctx.shadowBlur = 16 * sc * spProf.hover;
+      }
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+      ctx.lineWidth = 2.6 * sc;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(0, 0, r - 1.5, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.beginPath();
+      ctx.arc(0, -r * 0.24, r * 0.31, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.roundRect(-r * 0.54, r * 0.14, r * 1.08, r * 0.9, [r * 0.32, r * 0.32, 0, 0]);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Skin Selection Carousel ('SKINS')
+    function renderSkins(dt) {
+      renderAmbientBackground(dt);
+      const cx = W * 0.5, cy = H * 0.5, sc = 0.94;
+      carouselPos += (selectedSkin - carouselPos) * (1 - Math.exp(-14 * dt));
+
+      // Top-left pointed BACK arrow button
+      const spBack = skinSprings[0];
+      const backHover = ptr.x >= 10 && ptr.x <= 246 && ptr.y >= 12 && ptr.y <= 116;
+      stepArcadeSpring(spBack, backHover, 1.24, dt);
+
+      ctx.save();
+      ctx.translate(128 + Math.sin(spBack.phase * 15) * 8 * spBack.hover, 64);
+      ctx.rotate(Math.sin(spBack.phase * 13) * 0.06 * spBack.hover);
+      ctx.scale(spBack.s, spBack.s);
+
+      const backGrad = ctx.createLinearGradient(0, -54, 0, 54);
+      backGrad.addColorStop(0, 'rgba(28,28,28,0)');
+      backGrad.addColorStop(0.2, 'rgba(34,34,34,0.75)');
+      backGrad.addColorStop(0.8, 'rgba(34,34,34,0.75)');
+      backGrad.addColorStop(1, 'rgba(28,28,28,0)');
+      ctx.fillStyle = backGrad;
+      ctx.fillRect(-84, -54, 198, 108);
+
+      ctx.fillStyle = '#cfcfcf';
+      ctx.shadowColor = spBack.hover > 0.1 ? `rgba(255,255,255,${0.55 * spBack.hover})` : 'rgba(0,0,0,0.6)';
+      ctx.shadowBlur = 12 + 14 * spBack.hover;
+      ctx.beginPath();
+      ctx.moveTo(-116, 0);
+      ctx.lineTo(-84, -40);
+      ctx.lineTo(114, -40);
+      ctx.lineTo(114, 40);
+      ctx.lineTo(-84, 40);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#1b1b1b';
+      ctx.font = `800 38px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText('BACK', 12, 2);
+      ctx.restore();
+
+      // Top-center glowing "lvl X" & selected skin name
+      const activeSk = SKINS[selectedSkin];
+      const unlocked = level >= activeSk.reqLevel;
+      const isEquipped = equippedSkin === activeSk.id;
+
+      ctx.save();
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(255,255,255,0.45)';
+      ctx.shadowBlur = 14 * sc;
+      ctx.font = `800 ${Math.round(52 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(`lvl ${level}`, cx, cy - 238 * sc);
+
+      ctx.shadowBlur = 10 * sc;
+      ctx.font = `600 ${Math.round(48 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(activeSk.name, cx, cy - 182 * sc);
+      ctx.restore();
+
+      // Horizontal Skin Carousel
+      const orbY = cy - 16 * sc;
+      for (let i = 0; i < SKINS.length; i++) {
+        const offset = i - carouselPos;
+        if (Math.abs(offset) > 3.2) continue;
+        const sk = SKINS[i];
+        const skUnlocked = level >= sk.reqLevel;
+        const distFactor = Math.max(0, 1 - Math.min(1, Math.abs(offset)));
+        const r = (42 + 64 * distFactor) * sc;
+        const ix = cx + offset * 175 * sc;
+
+        ctx.save();
+        ctx.translate(ix, orbY);
+        if (distFactor > 0.7) {
+          const pulse = 1 + Math.sin(elapsed * 3.1) * 0.022 * distFactor;
+          ctx.scale(pulse, pulse);
+        }
+        drawSkin(sk.id, r, !skUnlocked, sk.reqLevel);
+        ctx.restore();
+      }
+
+      // EQUIPPED / EQUIP / LVL X action button
+      const actY = cy + 148 * sc, actW = 224 * sc, actH = 66 * sc;
+      const spAct = skinSprings[1];
+      const actHover = Math.abs(ptr.x - cx) <= actW * 0.54 && Math.abs(ptr.y - actY) <= actH * 0.54;
+      stepArcadeSpring(spAct, actHover, unlocked && !isEquipped ? 1.26 : 1.08, dt);
+
+      const actGrad = ctx.createLinearGradient(cx, actY - actH * 0.5 - 12 * sc, cx, actY + actH * 0.5 + 12 * sc);
+      actGrad.addColorStop(0, 'rgba(28,28,28,0)');
+      actGrad.addColorStop(0.2, 'rgba(34,34,34,0.8)');
+      actGrad.addColorStop(0.8, 'rgba(34,34,34,0.8)');
+      actGrad.addColorStop(1, 'rgba(28,28,28,0)');
+      ctx.fillStyle = actGrad;
+      ctx.fillRect(cx - actW * 0.5, actY - actH * 0.5 - 12 * sc, actW, actH + 24 * sc);
+
+      const btnLabel = !unlocked ? `LVL ${activeSk.reqLevel}` : (isEquipped ? 'EQUIPPED' : 'EQUIP');
+      ctx.save();
+      ctx.translate(cx + (unlocked && !isEquipped ? Math.sin(spAct.phase * 15) * 9 * sc * spAct.hover : 0), actY);
+      ctx.rotate(unlocked && !isEquipped ? Math.sin(spAct.phase * 13) * 0.07 * spAct.hover : 0);
+      ctx.scale(spAct.s, spAct.s);
+      ctx.fillStyle = !unlocked ? '#6e7275' : '#f8f8f8';
+      ctx.shadowColor = spAct.hover > 0.1 && unlocked ? `rgba(255,255,255,${0.55 * spAct.hover})` : 'rgba(0,0,0,0.6)';
+      ctx.shadowBlur = (10 + 14 * spAct.hover) * sc;
+      ctx.fillRect(-actW * 0.5, -actH * 0.5, actW, actH);
+
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = !unlocked ? '#181818' : '#1b1b1b';
+      ctx.font = `800 ${Math.round(32 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(btnLabel, 0, 2 * sc);
+      ctx.restore();
+
+      // Flavor description caption underneath action button
+      ctx.save();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `500 ${Math.round(30 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(unlocked ? activeSk.desc : `UNLOCK AT LEVEL ${activeSk.reqLevel}.`, cx, cy + 228 * sc);
+      ctx.restore();
+    }
+
+    // Procedural Icons inside each Essentials (0..2) & Elite (3..5) upgrade card
+    function drawUpgradeCardIcon(idx, size) {
+      const s = size;
+      ctx.save();
+      if (idx === 0) {
+        const pts = [
+          [-s * 0.28,  s * 0.14, '#f2544b', s * 0.065],
+          [-s * 0.15, -s * 0.24, null,      0],
+          [ s * 0.02, -s * 0.04, '#f2544b', s * 0.068],
+          [ s * 0.16, -s * 0.28, '#55d6ff', s * 0.082],
+          [ s * 0.29, -s * 0.16, '#f2544b', s * 0.062]
+        ];
+        ctx.strokeStyle = 'rgba(220,224,228,0.68)';
+        ctx.lineWidth = Math.max(2, s * 0.024);
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        pts.forEach(([px, py], i) => (i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py)));
+        ctx.stroke();
+
+        pts.forEach(([px, py, col, r]) => {
+          if (!col) return;
+          ctx.fillStyle = col;
+          ctx.shadowColor = col;
+          ctx.shadowBlur = 8;
+          ctx.beginPath();
+          ctx.arc(px, py, r, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      } else if (idx === 1) {
+        const ox = -s * 0.16, oy = -s * 0.04, ex = s * 0.30, ey = -s * 0.28;
+        const grad = ctx.createLinearGradient(ox, oy, ex, ey);
+        grad.addColorStop(0, 'rgba(185,188,192,0.9)');
+        grad.addColorStop(0.65, 'rgba(110,112,116,0.45)');
+        grad.addColorStop(1, 'rgba(60,60,60,0)');
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = Math.max(4, s * 0.055);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(ox, oy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+
+        ctx.fillStyle = '#55d6ff';
+        ctx.shadowColor = 'rgba(85,214,255,0.7)';
+        ctx.shadowBlur = 12;
+        ctx.beginPath();
+        ctx.arc(ox, oy, s * 0.165, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (idx === 2) {
+        const bw = s * 0.68, bh = s * 0.10, by = -s * 0.35;
+        ctx.fillStyle = '#66ff66';
+        ctx.fillRect(-bw * 0.5, by, bw * 0.48, bh);
+        ctx.fillStyle = '#69221e';
+        ctx.fillRect(-bw * 0.5 + bw * 0.48, by, bw * 0.52, bh);
+
+        const cr = s * 0.18, cyIcon = -s * 0.02;
+        ctx.fillStyle = '#f5f5f5';
+        ctx.shadowColor = 'rgba(255,255,255,0.65)';
+        ctx.shadowBlur = 14;
+        ctx.beginPath();
+        ctx.arc(0, cyIcon, cr, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#d94842';
+        const cw = cr * 0.24, cl = cr * 0.62;
+        ctx.fillRect(-cw, cyIcon - cl, cw * 2, cl * 2);
+        ctx.fillRect(-cl, cyIcon - cw, cl * 2, cw * 2);
+      } else if (idx === 3) {
+        const cyIcon = -s * 0.08;
+        ctx.fillStyle = '#55d6ff';
+        ctx.shadowColor = 'rgba(85,214,255,0.75)';
+        ctx.shadowBlur = 12;
+        ctx.beginPath();
+        ctx.arc(0, cyIcon, s * 0.145, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.shadowBlur = 6;
+        ctx.shadowColor = 'rgba(255,255,255,0.6)';
+        ctx.fillStyle = '#e6e8ea';
+        const dist = s * 0.29;
+        [[0, -dist], [dist, 0], [0, dist], [-dist, 0]].forEach(([ox, oy]) => {
+          ctx.beginPath();
+          ctx.arc(ox, cyIcon + oy, s * 0.042, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      } else if (idx === 4) {
+        const cyIcon = -s * 0.06;
+        ctx.fillStyle = '#585c60';
+        [
+          [-s * 0.25, -s * 0.13, s * 0.105],
+          [-s * 0.15,  s * 0.05, s * 0.115],
+          [ s * 0.01,  s * 0.14, s * 0.115]
+        ].forEach(([ex, ey, er]) => {
+          ctx.beginPath();
+          ctx.arc(ex, cyIcon + ey, er, 0, Math.PI * 2);
+          ctx.fill();
+        });
+
+        ctx.fillStyle = '#55d6ff';
+        ctx.shadowColor = 'rgba(85,214,255,0.75)';
+        ctx.shadowBlur = 12;
+        ctx.beginPath();
+        ctx.arc(s * 0.14, cyIcon - s * 0.14, s * 0.145, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        const cyIcon = -s * 0.08, br = s * 0.25;
+        const corona = ctx.createRadialGradient(0, cyIcon, br * 0.72, 0, cyIcon, br * 1.48);
+        corona.addColorStop(0, 'rgba(185, 65, 225, 0.92)');
+        corona.addColorStop(0.55, 'rgba(120, 30, 165, 0.45)');
+        corona.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = corona;
+        ctx.beginPath();
+        ctx.arc(0, cyIcon, br * 1.48, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#141416';
+        ctx.strokeStyle = 'rgba(195, 85, 235, 0.85)';
+        ctx.lineWidth = Math.max(1.8, s * 0.022);
+        ctx.beginPath();
+        ctx.arc(0, cyIcon, br, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // Two-Page Upgrades Screen ('ESSENTIALS' & 'ELITE') with Clean Selection Animations
+    function renderUpgrades(dt) {
+      renderAmbientBackground(dt);
+      const cx = W * 0.5, cy = H * 0.5, sc = 0.94;
+      const isElite = upgradePage === 1;
+      const themeAccent = isElite ? '#f6ee7e' : '#ffffff';
+      const themeGlow = isElite ? 'rgba(246,238,126,0.65)' : 'rgba(255,255,255,0.35)';
+
+      // Advance page entrance, page slide, title bounce, cash roll-up, and shake timers
+      upgradeEnterT = Math.min(1.2, upgradeEnterT + dt * 2.4);
+      upgradePageSlide *= Math.exp(-15 * dt);
+      if (Math.abs(upgradePageSlide) < 0.25) upgradePageSlide = 0;
+      upgradeTitlePop *= Math.exp(-12 * dt);
+      displayCash += (cash - displayCash) * (1 - Math.exp(-14 * dt));
+      if (Math.abs(cash - displayCash) < 0.5) displayCash = cash;
+      if (buyShakeT > 0) buyShakeT = Math.max(0, buyShakeT - dt);
+
+      // Smoothly interpolate cardFocus, cardPunch, and pipPop bursts
+      for (let i = 0; i < 6; i++) {
+        const targetFocus = selectedUpgrade === i ? 1 : 0;
+        cardFocus[i] += (targetFocus - cardFocus[i]) * (1 - Math.exp(-16 * dt));
+        cardPunch[i] *= Math.exp(-14 * dt);
+        for (let p = 0; p < 6; p++) {
+          if (pipPop[i][p] > 0) {
+            pipPop[i][p] = Math.max(0, pipPop[i][p] - dt * 2.6);
+          }
+        }
+      }
+
+      // Top-left pointed BACK arrow button
+      const spBack = upgSprings[0];
+      const backHover = ptr.x >= 10 && ptr.x <= 246 && ptr.y >= 12 && ptr.y <= 116;
+      stepArcadeSpring(spBack, backHover, 1.24, dt);
+
+      ctx.save();
+      ctx.translate(128 + Math.sin(spBack.phase * 15) * 8 * spBack.hover, 64);
+      ctx.rotate(Math.sin(spBack.phase * 13) * 0.06 * spBack.hover);
+      ctx.scale(spBack.s, spBack.s);
+
+      const backGrad = ctx.createLinearGradient(0, -54, 0, 54);
+      backGrad.addColorStop(0, 'rgba(28,28,28,0)');
+      backGrad.addColorStop(0.2, 'rgba(34,34,34,0.75)');
+      backGrad.addColorStop(0.8, 'rgba(34,34,34,0.75)');
+      backGrad.addColorStop(1, 'rgba(28,28,28,0)');
+      ctx.fillStyle = backGrad;
+      ctx.fillRect(-84, -54, 198, 108);
+
+      ctx.fillStyle = '#f8f8f8';
+      ctx.shadowColor = spBack.hover > 0.1 ? `rgba(255,255,255,${0.55 * spBack.hover})` : 'rgba(0,0,0,0.6)';
+      ctx.shadowBlur = 12 + 14 * spBack.hover;
+      ctx.beginPath();
+      ctx.moveTo(-116, 0);
+      ctx.lineTo(-84, -40);
+      ctx.lineTo(114, -40);
+      ctx.lineTo(114, 40);
+      ctx.lineTo(-84, 40);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#1b1b1b';
+      ctx.font = `800 38px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText('BACK', 12, 2);
+      ctx.restore();
+
+      // Top-center rolling yellow "$cash" & animated page title ('ESSENTIALS' or 'ELITE')
+      ctx.save();
+      ctx.fillStyle = '#f8f272';
+      ctx.shadowColor = 'rgba(248,242,114,0.75)';
+      ctx.shadowBlur = 22 * sc;
+      ctx.font = `800 ${Math.round(74 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(formatCash(displayCash), cx, cy - 244 * sc);
+
+      const titleScale = 1 + Math.sin(upgradeTitlePop * Math.PI) * 0.11;
+      ctx.save();
+      ctx.translate(cx, cy - 166 * sc);
+      ctx.scale(titleScale, titleScale);
+      ctx.fillStyle = themeAccent;
+      ctx.shadowColor = themeGlow;
+      ctx.shadowBlur = 14 * sc;
+      ctx.font = `800 ${Math.round(62 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(isElite ? 'ELITE' : 'ESSENTIALS', 0, 0);
+      ctx.restore();
+      ctx.restore();
+
+      // Selected upgrade cost header above the cards
+      const curUpg = UPGRADES[selectedUpgrade];
+      const isMaxed = curUpg.rank >= 6;
+      const curCost = isMaxed ? 0 : curUpg.costs[curUpg.rank];
+      const canAfford = !isMaxed && cash >= curCost;
+      const costShakeX = buyShakeT > 0 ? Math.sin(buyShakeT * 68) * 10 * (buyShakeT / 0.36) : 0;
+
+      ctx.save();
+      ctx.fillStyle = isMaxed ? '#66ff66' : (buyShakeT > 0 ? '#ff6464' : '#f8f272');
+      ctx.shadowColor = isMaxed ? 'rgba(102,255,102,0.65)' : 'rgba(248,242,114,0.75)';
+      ctx.shadowBlur = 14 * sc;
+      ctx.font = `800 ${Math.round(32 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(isMaxed ? 'MAXED' : formatCash(curCost), cx + costShakeX, cy - 96 * sc);
+      ctx.restore();
+
+      // Left '<' and Right '>' square navigation buttons
+      const arrowY = cy + 4 * sc, arrowW = 54 * sc, arrowH = 74 * sc;
+      [
+        ['<', cx - 356 * sc, upgSprings[1]],
+        ['>', cx + 356 * sc, upgSprings[2]]
+      ].forEach(([sym, ax, sp]) => {
+        const hovered = Math.abs(ptr.x - ax) <= arrowW * 0.6 && Math.abs(ptr.y - arrowY) <= arrowH * 0.6;
+        stepArcadeSpring(sp, hovered, 1.26, dt);
+
+        const aGrad = ctx.createLinearGradient(ax, arrowY - arrowH * 0.5 - 12 * sc, ax, arrowY + arrowH * 0.5 + 12 * sc);
+        aGrad.addColorStop(0, 'rgba(28,28,28,0)');
+        aGrad.addColorStop(0.2, 'rgba(34,34,34,0.78)');
+        aGrad.addColorStop(0.8, 'rgba(34,34,34,0.78)');
+        aGrad.addColorStop(1, 'rgba(28,28,28,0)');
+        ctx.fillStyle = aGrad;
+        ctx.fillRect(ax - arrowW * 0.5, arrowY - arrowH * 0.5 - 12 * sc, arrowW, arrowH + 24 * sc);
+
+        ctx.save();
+        ctx.translate(ax + Math.sin(sp.phase * 15) * 7 * sc * sp.hover, arrowY);
+        ctx.rotate(Math.sin(sp.phase * 13) * 0.08 * sp.hover);
+        ctx.scale(sp.s, sp.s);
+        ctx.fillStyle = '#f8f8f8';
+        ctx.shadowColor = sp.hover > 0.1 ? `rgba(255,255,255,${0.55 * sp.hover})` : 'rgba(0,0,0,0.6)';
+        ctx.shadowBlur = (10 + 14 * sp.hover) * sc;
+        ctx.fillRect(-arrowW * 0.5, -arrowH * 0.5, arrowW, arrowH);
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#1b1b1b';
+        ctx.font = `900 ${Math.round(42 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(sym, 0, 2 * sc);
+        ctx.restore();
+      });
+
+      // Smoothly gliding selection cursor bracket & chevron underneath the active card
+      const cardY = cy - 2 * sc, cardSpacing = 152 * sc, cardSize = 108 * sc;
+      const targetCursorX = cx + ((selectedUpgrade % 3) - 1) * cardSpacing;
+      upgradeCursorX += (targetCursorX - upgradeCursorX) * (1 - Math.exp(-18 * dt));
+      const slideAlpha = Math.max(0.25, 1 - Math.abs(upgradePageSlide) / 150);
+
+      ctx.save();
+      ctx.globalAlpha = slideAlpha;
+      const cursorY = cardY + cardSize * 0.5 + 32 * sc;
+      ctx.fillStyle = isElite ? '#f6ee7e' : '#f8f272';
+      ctx.shadowColor = isElite ? 'rgba(246,238,126,0.85)' : 'rgba(248,242,114,0.85)';
+      ctx.shadowBlur = 12 * sc;
+      ctx.beginPath();
+      ctx.roundRect(upgradeCursorX - 28 * sc, cursorY, 56 * sc, 4 * sc, 2 * sc);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(upgradeCursorX, cursorY - 6 * sc);
+      ctx.lineTo(upgradeCursorX - 6 * sc, cursorY + 1 * sc);
+      ctx.lineTo(upgradeCursorX + 6 * sc, cursorY + 1 * sc);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+
+      // Three upgrade cards with staggered entrance, kinetic slide, smooth focus lift & pip pop
+      for (let i = 0; i < 3; i++) {
+        const upgIdx = upgradePage * 3 + i;
+        const u = UPGRADES[upgIdx];
+        const focus = cardFocus[upgIdx];
+        const punch = cardPunch[upgIdx];
+        const staggerRaw = Math.max(0, Math.min(1, (upgradeEnterT - i * 0.11) / 0.42));
+        const easeOut = 1 - Math.pow(1 - staggerRaw, 3);
+
+        const cardX = cx + (i - 1) * cardSpacing + upgradePageSlide;
+        const hovered = Math.abs(ptr.x - (cx + (i - 1) * cardSpacing)) <= cardSize * 0.58 && Math.abs(ptr.y - cardY) <= cardSize * 0.65;
+        const hoverBoost = hovered && focus < 0.5 ? 0.06 : 0;
+        const liftY = -14 * sc * focus + (1 - easeOut) * 26 * sc;
+        const cardScale = (1 + 0.18 * focus + punch + hoverBoost) * (0.86 + 0.14 * easeOut);
+
+        ctx.save();
+        ctx.globalAlpha = easeOut * slideAlpha * (0.72 + 0.28 * focus);
+        ctx.translate(cardX, cardY + liftY);
+        ctx.scale(cardScale, cardScale);
+
+        ctx.fillStyle = '#111111';
+        ctx.strokeStyle = isElite
+          ? (focus > 0.4 ? '#fff69b' : 'rgba(246,238,126,0.75)')
+          : (focus > 0.4 ? '#f8f272' : 'rgba(248,248,248,0.78)');
+        ctx.lineWidth = (4.8 + 1.4 * focus) * sc;
+        if (focus > 0.08) {
+          ctx.shadowColor = isElite
+            ? `rgba(246,238,126,${0.7 * focus})`
+            : `rgba(248,242,114,${0.6 * focus})`;
+          ctx.shadowBlur = 20 * sc * focus;
+        }
+        ctx.fillRect(-cardSize * 0.5, -cardSize * 0.5, cardSize, cardSize);
+        ctx.strokeRect(-cardSize * 0.5, -cardSize * 0.5, cardSize, cardSize);
+        ctx.shadowBlur = 0;
+
+        drawUpgradeCardIcon(upgIdx, cardSize);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `900 ${Math.round(11.5 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(u.label, 0, cardSize * 0.36);
+
+        // 6 segmented square rank pips beneath the card with animated pop burst
+        const pipCount = 6, pipSize = 11.2 * sc, pipGap = 4.2 * sc;
+        const totalPipW = pipCount * pipSize + (pipCount - 1) * pipGap;
+        const pipStartX = -totalPipW * 0.5;
+        const pipY = cardSize * 0.5 + 9 * sc;
+        for (let p = 0; p < pipCount; p++) {
+          const px = pipStartX + p * (pipSize + pipGap);
+          const popVal = pipPop[upgIdx][p];
+          const pScale = 1 + Math.sin(popVal * Math.PI) * 0.55;
+
+          ctx.save();
+          ctx.translate(px + pipSize * 0.5, pipY + pipSize * 0.5);
+          ctx.scale(pScale, pScale);
+          if (p < u.rank) {
+            ctx.fillStyle = popVal > 0.1
+              ? '#ffffff'
+              : (isElite ? '#f6ee7e' : (u.rank >= 6 ? '#f8f272' : '#66ff66'));
+            ctx.fillRect(-pipSize * 0.5, -pipSize * 0.5, pipSize, pipSize);
+          }
+          ctx.strokeStyle = isElite
+            ? (p < u.rank ? '#f6ee7e' : 'rgba(246,238,126,0.55)')
+            : (p < u.rank ? '#ffffff' : 'rgba(255,255,255,0.45)');
+          ctx.lineWidth = 1.3 * sc;
+          ctx.strokeRect(-pipSize * 0.5, -pipSize * 0.5, pipSize, pipSize);
+          ctx.restore();
+        }
+        ctx.restore();
+      }
+
+      // Lore subtitle & mechanical stat readout above BUY button
+      ctx.save();
+      ctx.globalAlpha = slideAlpha;
+      ctx.fillStyle = isElite ? '#c88c88' : 'rgba(215,220,225,0.78)';
+      ctx.font = `700 ${Math.round(25 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(curUpg.lore, cx + upgradePageSlide * 0.35, cy + 150 * sc);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(255,255,255,0.3)';
+      ctx.shadowBlur = 8 * sc;
+      ctx.font = `700 ${Math.round(21 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(curUpg.statText(curUpg.rank), cx + upgradePageSlide * 0.35, cy + 190 * sc);
+      ctx.restore();
+
+      // Purchase celebration sparks
+      for (let i = 0; i < PARTICLE_MAX; i++) {
+        const p = parts[i];
+        if (!p.active) continue;
+        p.life -= dt;
+        if (p.life <= 0) { p.active = false; continue; }
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vy += 260 * dt;
+        ctx.save();
+        ctx.globalAlpha = p.life / p.maxLife;
+        ctx.fillStyle = p.color;
+        ctx.shadowColor = p.color;
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * (p.life / p.maxLife), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Bottom centered white BUY button with arcade spring hover + insufficient-cash shake
+      const buyY = cy + 278 * sc, buyW = 248 * sc, buyH = 74 * sc;
+      const spBuy = upgSprings[3];
+      const buyHover = Math.abs(ptr.x - cx) <= buyW * 0.58 && Math.abs(ptr.y - buyY) <= buyH * 0.58;
+      stepArcadeSpring(spBuy, buyHover, canAfford ? 1.26 : 1.06, dt);
+
+      const buyGrad = ctx.createLinearGradient(cx, buyY - buyH * 0.5 - 14 * sc, cx, buyY + buyH * 0.5 + 14 * sc);
+      buyGrad.addColorStop(0, 'rgba(28,28,28,0)');
+      buyGrad.addColorStop(0.18, 'rgba(34,34,34,0.82)');
+      buyGrad.addColorStop(0.82, 'rgba(34,34,34,0.82)');
+      buyGrad.addColorStop(1, 'rgba(28,28,28,0)');
+      ctx.fillStyle = buyGrad;
+      ctx.fillRect(cx - buyW * 0.5, buyY - buyH * 0.5 - 14 * sc, buyW, buyH + 28 * sc);
+
+      const shakeX = buyShakeT > 0 ? Math.sin(buyShakeT * 68) * 11 * (buyShakeT / 0.36) : 0;
+      const buyLabel = isMaxed ? 'MAXED' : 'BUY';
+      ctx.save();
+      ctx.translate(cx + shakeX + (canAfford ? Math.sin(spBuy.phase * 15) * 10 * sc * spBuy.hover : 0), buyY);
+      ctx.rotate(canAfford ? Math.sin(spBuy.phase * 13) * 0.075 * spBuy.hover : 0);
+      ctx.scale(spBuy.s, spBuy.s);
+      ctx.fillStyle = isMaxed ? '#8a8a8a' : (canAfford ? '#f8f8f8' : '#555555');
+      ctx.shadowColor = spBuy.hover > 0.1 && canAfford ? `rgba(255,255,255,${0.55 * spBuy.hover})` : 'rgba(0,0,0,0.65)';
+      ctx.shadowBlur = (10 + 16 * spBuy.hover) * sc;
+      ctx.fillRect(-buyW * 0.5, -buyH * 0.5, buyW, buyH);
+
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = isMaxed ? '#1b1b1b' : (canAfford ? '#1b1b1b' : '#9a9a9a');
+      ctx.font = `800 ${Math.round(38 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(buyLabel, 0, 2 * sc);
+      ctx.restore();
+    }
+
+    function renderGame(dt) {
+      const unlimitedSlomo = isSlomoUnlimited();
+      const maxSlomoDur = getSlomoDuration();
+      const maxSlomoCd = getSlomoCooldown();
+
+      // Real-time slo-mo energy drain & cooldown recharge
+      if (isSlomo) {
+        if (!unlimitedSlomo) {
+          slomoEnergy -= dt;
+          if (slomoEnergy <= 0) {
+            slomoEnergy = 0;
+            releaseSlomoLaunch();
+          }
+        }
+      } else {
+        if (slomoCooldown > 0) {
+          slomoCooldown = Math.max(0, slomoCooldown - dt);
+        }
+        slomoEnergy = unlimitedSlomo ? 1 : Math.min(maxSlomoDur, slomoEnergy + dt * (maxSlomoDur / 1.6));
+      }
+
+      // Real-time combo timer countdown
+      if (comboCount > 0) {
+        comboTimer -= dt;
+        if (comboTimer <= 0) {
+          comboTimer = 0;
+          comboCount = 0;
+        }
+      }
+      stepArcadeSpring(comboSpring, comboCount >= 2, 1.0, dt);
+
+      // 0.12x slo-mo dilation
+      const targetScale = isSlomo ? 0.12 : 1.0;
+      timeScale += (targetScale - timeScale) * (1 - Math.exp(-18 * dt));
+      const wdt = dt * timeScale;
+
+      ctx.save();
+      if (shake > 0.1) {
+        ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+        shake *= Math.exp(-14 * dt);
+      } else {
+        shake = 0;
+      }
+
+      ctx.fillStyle = '#171717';
+      ctx.fillRect(0, 0, W, H);
+
+      // Motion trail behind player orb
+      trailTimer -= wdt;
+      const spd = Math.hypot(player.vx, player.vy);
+      if (trailTimer <= 0 && spd > 90) {
+        trailTimer = 0.018;
+        for (let i = 0; i < TRAIL_MAX; i++) {
+          if (!trail[i].active) {
+            trail[i].active = true;
+            trail[i].x = player.x;
+            trail[i].y = player.y;
+            trail[i].r = player.r * 0.4;
+            trail[i].alpha = 0.28;
+            break;
+          }
+        }
+      }
+      for (let i = 0; i < TRAIL_MAX; i++) {
+        const t = trail[i];
+        if (!t.active) continue;
+        t.alpha -= wdt * 1.15;
+        t.r *= Math.pow(0.28, wdt);
+        if (t.alpha <= 0.01) {
+          t.active = false;
+          continue;
+        }
+        ctx.fillStyle = `rgba(175,185,195,${t.alpha})`;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, t.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Player physics & elastic wall rebounds
+      player.vy += 260 * wdt;
+      const drag = Math.pow(0.76, wdt);
+      player.vx *= drag;
+      player.vy *= drag;
+      player.x += player.vx * wdt;
+      player.y += player.vy * wdt;
+
+      if (player.x - player.r < 0) { player.x = player.r; player.vx = Math.abs(player.vx) * 0.88; }
+      else if (player.x + player.r > W) { player.x = W - player.r; player.vx = -Math.abs(player.vx) * 0.88; }
+      if (player.y - player.r < 0) { player.y = player.r; player.vy = Math.abs(player.vy) * 0.88; }
+      else if (player.y + player.r > H) { player.y = H - player.r; player.vy = -Math.abs(player.vy) * 0.88; }
+
+      // ELITE: DEADLY ECHOS
+      const activeEchoCap = getEchoCount();
+      const playerSpeedNow = Math.hypot(player.vx, player.vy);
+      if (activeEchoCap > 0 && !isSlomo && playerSpeedNow > 390) {
+        echoSpawnTimer -= wdt;
+        if (echoSpawnTimer <= 0) {
+          echoSpawnTimer = 0.065;
+          let activeEchos = 0, oldestIdx = -1, lowestLife = Infinity;
+          for (let i = 0; i < ECHO_MAX; i++) {
+            if (echos[i].active) {
+              activeEchos++;
+              if (echos[i].life < lowestLife) {
+                lowestLife = echos[i].life;
+                oldestIdx = i;
+              }
+            }
+          }
+          let slot = -1;
+          if (activeEchos < activeEchoCap) {
+            for (let i = 0; i < ECHO_MAX; i++) {
+              if (!echos[i].active) { slot = i; break; }
+            }
+          } else {
+            slot = oldestIdx;
+          }
+          if (slot !== -1) {
+            const ec = echos[slot];
+            ec.active = true;
+            ec.x = player.x;
+            ec.y = player.y;
+            ec.r = player.r * 0.68;
+            ec.maxLife = getEchoDuration();
+            ec.life = ec.maxLife;
+          }
+        }
+      }
+
+      for (let i = 0; i < ECHO_MAX; i++) {
+        const ec = echos[i];
+        if (!ec.active) continue;
+        ec.life -= wdt;
+        if (ec.life <= 0) {
+          ec.active = false;
+          continue;
+        }
+        const ratio = ec.life / ec.maxLife;
+        ctx.save();
+        ctx.globalAlpha = 0.25 + ratio * 0.55;
+        ctx.fillStyle = '#5c6066';
+        ctx.shadowColor = 'rgba(140, 190, 220, 0.55)';
+        ctx.shadowBlur = 14;
+        ctx.beginPath();
+        ctx.arc(ec.x, ec.y, ec.r * (0.75 + ratio * 0.25), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // ELITE: BLACK HOLE
+      const bhRadius = getBlackHoleRadius();
+      const bhPull = getBlackHolePull();
+      const bhActive = bhRadius > 0 && !isSlomo && playerSpeedNow > 340;
+      if (bhActive) {
+        ctx.save();
+        const bhGrad = ctx.createRadialGradient(player.x, player.y, player.r * 0.9, player.x, player.y, bhRadius);
+        bhGrad.addColorStop(0, 'rgba(155, 55, 215, 0.26)');
+        bhGrad.addColorStop(0.65, 'rgba(105, 25, 165, 0.12)');
+        bhGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = bhGrad;
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, bhRadius, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.strokeStyle = 'rgba(185, 80, 240, 0.35)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([10, 10]);
+        ctx.lineDashOffset = -elapsed * 65;
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, bhRadius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // ELITE: ORBITAL STRIKES (up to 6 grey sentinel satellites, 2 HP each, 3.2s recharge)
+      const totalOrbitals = getOrbitalCount();
+      if (totalOrbitals > 0) {
+        orbitalAngle += wdt * 3.1;
+        const orbitDist = player.r + 28;
+        for (let i = 0; i < totalOrbitals; i++) {
+          const o = orbitals[i];
+          const ang = orbitalAngle + (i * Math.PI * 2) / totalOrbitals;
+          o.x = player.x + Math.cos(ang) * orbitDist;
+          o.y = player.y + Math.sin(ang) * orbitDist;
+          if (!o.active) {
+            o.recharge -= wdt;
+            if (o.recharge <= 0) {
+              o.active = true;
+              o.hp = 2;
+              spawnBurst(o.x, o.y, '#d0d6dc', 8);
+            }
+            continue;
+          }
+          ctx.save();
+          ctx.fillStyle = o.hp >= 2 ? '#b4bac0' : '#6c7075';
+          ctx.shadowColor = o.hp >= 2 ? 'rgba(220, 230, 240, 0.65)' : 'rgba(120, 125, 130, 0.35)';
+          ctx.shadowBlur = o.hp >= 2 ? 12 : 6;
+          ctx.beginPath();
+          ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
+          ctx.fill();
+          if (o.hp >= 2) {
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(o.x, o.y, o.r + 3, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+
+      // Spawn & update falling balls (2 balls per wave)
+      if (!tutorialActive && fadeDir === 0) {
+        spawnTimer -= wdt;
+        if (spawnTimer <= 0) {
+          spawnWave();
+          spawnTimer = Math.max(0.55, 1.48 - Math.min(0.68, score / 4500));
+        }
+      }
+
+      const enemyStyles = [
+        ['#f2544b', 'rgba(242,84,75,0.45)', 50],
+        ['#4da6ff', 'rgba(77,166,255,0.45)', 100],
+        ['#ffd84d', 'rgba(255,216,77,0.55)', 1000],
+        ['#6cf754', 'rgba(108,247,84,0.45)', 0]
+      ];
+
+      for (let i = 0; i < ENEMY_MAX; i++) {
+        const e = enemies[i];
+        if (!e.active) continue;
+        e.y += e.vy * wdt;
+        e.a += e.va * wdt;
+
+        if (bhActive) {
+          const bdx = player.x - e.x;
+          const bdy = player.y - e.y;
+          const bdist = Math.hypot(bdx, bdy);
+          if (bdist > 1 && bdist < bhRadius) {
+            const factor = (1 - bdist / bhRadius) * bhPull * wdt;
+            if (e.type === 3) {
+              e.x -= (bdx / bdist) * factor * 0.45;
+              e.y -= (bdy / bdist) * factor * 0.45;
+            } else {
+              e.x += (bdx / bdist) * factor;
+              e.y += (bdy / bdist) * factor;
+            }
+          }
+        }
+
+        // Bottom boundary leak check
+        if (e.y - e.r > H) {
+          e.active = false;
+          if (e.type === 0 && fadeDir === 0) {
+            hp = Math.max(0, hp - 20);
+            comboCount = 0;
+            comboTimer = 0;
+            shake = 14;
+            spawnBurst(e.x, H - 8, '#f2544b', 16);
+            if (hp <= 0) triggerGameOver();
+          }
+          continue;
+        }
+
+        // Circle-circle collision between player orb and falling ball
+        const dx = player.x - e.x;
+        const dy = player.y - e.y;
+        const dist = Math.hypot(dx, dy);
+        const minDist = player.r + e.r;
+        if (dist < minDist) {
+          e.active = false;
+          const [col, , baseXp] = enemyStyles[e.type];
+          if (e.type === 3) {
+            hp = 0;
+            comboCount = 0;
+            comboTimer = 0;
+            shake = 22;
+            spawnBurst(e.x, e.y, col, 26);
+            triggerGameOver();
+          } else {
+            // Elastic vector reflection off smashed ball
+            const nx = dist > 0.001 ? dx / dist : 0;
+            const ny = dist > 0.001 ? dy / dist : -1;
+            player.x = e.x + nx * (minDist + 2);
+            player.y = e.y + ny * (minDist + 2);
+            const dot = player.vx * nx + player.vy * ny;
+            if (dot < 0) {
+              player.vx -= 2 * dot * nx;
+              player.vy -= 2 * dot * ny;
+            }
+            const curSpd = Math.hypot(player.vx, player.vy);
+            const bounceSpd = Math.max(460, curSpd * 0.96);
+            const outLen = Math.hypot(player.vx, player.vy) || 1;
+            player.vx = (player.vx / outLen) * bounceSpd;
+            player.vy = (player.vy / outLen) * bounceSpd;
+
+            const comboCap = getMaxComboCap();
+            comboCount = Math.min(comboCap, comboCount + 1);
+            comboTimer = COMBO_WINDOW;
+            const mult = getComboMultiplier(comboCount);
+            if (mult > maxComboMult) maxComboMult = mult;
+
+            if (comboCount >= 2) {
+              comboSpring.s = 1.48;
+              comboSpring.v = 3.2;
+            }
+
+            const gainedXp = Math.round(baseXp * mult);
+            score += gainedXp;
+            kills++;
+            addPlayerXp(gainedXp);
+
+            const subLabel = comboCount >= 2 ? `x${mult.toFixed(2)} COMBO!` : '';
+            const popColor = comboCount >= 5 ? '#ff5e7e' : comboCount >= 2 ? '#ffe855' : col;
+            const popScale = Math.min(1.45, 1 + (comboCount - 1) * 0.06);
+            spawnFloatText(e.x, e.y - 12, `+${gainedXp}`, subLabel, popColor, popScale);
+
+            shake = e.type === 2 ? 15 : 8;
+            spawnBurst(e.x, e.y, col, e.type === 2 ? 24 : 15);
+          }
+          continue;
+        }
+
+        // ELITE: ORBITAL STRIKES collisions (2 HP each)
+        let destroyedByElite = false;
+        for (let oi = 0; oi < totalOrbitals; oi++) {
+          const o = orbitals[oi];
+          if (!o.active) continue;
+          if (Math.hypot(o.x - e.x, o.y - e.y) < o.r + e.r) {
+            e.active = false;
+            destroyedByElite = true;
+            o.hp--;
+            const [col, , baseXp] = enemyStyles[e.type];
+            if (o.hp <= 0) {
+              o.active = false;
+              o.recharge = 3.2;
+              spawnBurst(o.x, o.y, '#c8ced4', 12);
+            } else {
+              spawnBurst(o.x, o.y, '#ffffff', 6);
+            }
+            if (e.type === 3) {
+              shake = 10;
+              spawnBurst(e.x, e.y, col, 18);
+              spawnFloatText(e.x, e.y - 10, 'SHIELDED!', 'ORBITAL BLOCK', '#c8ced4', 0.95);
+            } else {
+              const comboCap = getMaxComboCap();
+              comboCount = Math.min(comboCap, comboCount + 1);
+              comboTimer = COMBO_WINDOW;
+              const mult = getComboMultiplier(comboCount);
+              if (mult > maxComboMult) maxComboMult = mult;
+              if (comboCount >= 2) { comboSpring.s = 1.42; comboSpring.v = 2.8; }
+              const gainedXp = Math.round(baseXp * mult);
+              score += gainedXp;
+              kills++;
+              addPlayerXp(gainedXp);
+              spawnFloatText(e.x, e.y - 10, `+${gainedXp}`, 'ORBITAL HIT', '#d6dde4', 0.95);
+              spawnBurst(e.x, e.y, col, 14);
+            }
+            break;
+          }
+        }
+        if (destroyedByElite) continue;
+
+        // ELITE: DEADLY ECHOS collisions
+        if (e.type !== 3) {
+          for (let ei = 0; ei < ECHO_MAX; ei++) {
+            const ec = echos[ei];
+            if (!ec.active) continue;
+            if (Math.hypot(ec.x - e.x, ec.y - e.y) < ec.r + e.r) {
+              e.active = false;
+              destroyedByElite = true;
+              const [col, , baseXp] = enemyStyles[e.type];
+              const comboCap = getMaxComboCap();
+              comboCount = Math.min(comboCap, comboCount + 1);
+              comboTimer = COMBO_WINDOW;
+              const mult = getComboMultiplier(comboCount);
+              if (mult > maxComboMult) maxComboMult = mult;
+              if (comboCount >= 2) { comboSpring.s = 1.42; comboSpring.v = 2.8; }
+              const gainedXp = Math.round(baseXp * mult);
+              score += gainedXp;
+              kills++;
+              addPlayerXp(gainedXp);
+              spawnFloatText(e.x, e.y - 10, `+${gainedXp}`, 'DEADLY ECHO!', '#9fd8ff', 0.95);
+              spawnBurst(e.x, e.y, col, 14);
+              break;
+            }
+          }
+        }
+        if (destroyedByElite) continue;
+
+        // Render falling ball / 10-point spiky hazard
+        const [fill, glow] = enemyStyles[e.type];
+        ctx.save();
+        ctx.translate(e.x, e.y);
+        ctx.rotate(e.a);
+        ctx.fillStyle = fill;
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 20;
+        if (e.type === 3) {
+          drawStar(e.r, e.r * 0.68, 10);
+        } else {
+          ctx.beginPath();
+          ctx.arc(0, 0, e.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      // Render shatter particles
+      for (let i = 0; i < PARTICLE_MAX; i++) {
+        const p = parts[i];
+        if (!p.active) continue;
+        p.life -= wdt;
+        if (p.life <= 0) { p.active = false; continue; }
+        p.x += p.vx * wdt;
+        p.y += p.vy * wdt;
+        ctx.save();
+        ctx.globalAlpha = p.life / p.maxLife;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * (p.life / p.maxLife), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Render floating XP / Combo popups
+      for (let i = 0; i < FLOAT_MAX; i++) {
+        const f = floats[i];
+        if (!f.active) continue;
+        f.life -= dt;
+        if (f.life <= 0) {
+          f.active = false;
+          continue;
+        }
+        f.y += f.vy * dt;
+        f.vy *= Math.pow(0.25, dt);
+        const progress = 1 - f.life / f.maxLife;
+        f.alpha = progress < 0.65 ? 1 : Math.max(0, 1 - (progress - 0.65) / 0.35);
+
+        ctx.save();
+        ctx.translate(f.x, f.y);
+        ctx.scale(f.scale, f.scale);
+        ctx.globalAlpha = f.alpha;
+        ctx.fillStyle = f.color;
+        ctx.shadowColor = f.color;
+        ctx.shadowBlur = 12;
+        ctx.font = `900 24px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(f.text, 0, 0);
+
+        if (f.subText) {
+          ctx.fillStyle = '#ffffff';
+          ctx.shadowColor = 'rgba(255,255,255,0.65)';
+          ctx.shadowBlur = 8;
+          ctx.font = `800 13px 'Segoe UI', Roboto, Arial, sans-serif`;
+          ctx.fillText(f.subText, 0, 19);
+        }
+        ctx.restore();
+      }
+
+      // Aiming ray, fading trajectory dots & squash-and-stretch for player orb
+      let targetStretch = 0;
+      if (isSlomo) {
+        const adx = ptr.x - player.x;
+        const ady = ptr.y - player.y;
+        const adist = Math.hypot(adx, ady);
+        if (adist > 4) {
+          player.angle = Math.atan2(ady, adx);
+          targetStretch = Math.min(0.42, (adist / 280) * 0.42);
+          const rayLen = Math.min(340, adist);
+          const nx = adx / adist, ny = ady / adist;
+          const ex = player.x + nx * rayLen;
+          const ey = player.y + ny * rayLen;
+          const rayGrad = ctx.createLinearGradient(player.x, player.y, ex, ey);
+          rayGrad.addColorStop(0, 'rgba(185,188,192,0.88)');
+          rayGrad.addColorStop(0.65, 'rgba(110,112,116,0.42)');
+          rayGrad.addColorStop(1, 'rgba(60,60,60,0)');
+          ctx.save();
+          ctx.strokeStyle = rayGrad;
+          ctx.lineWidth = 11;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(player.x, player.y);
+          ctx.lineTo(ex, ey);
+          ctx.stroke();
+
+          // Fading trajectory preview dots
+          const power = Math.min(1, adist / 280);
+          const previewSpd = 560 + power * 1160;
+          for (let d = 1; d <= 6; d++) {
+            const pt = d * 0.055;
+            const px = player.x + nx * previewSpd * pt;
+            const py = player.y + ny * previewSpd * pt + 0.5 * 260 * pt * pt;
+            ctx.fillStyle = `rgba(210, 225, 235, ${(1 - d / 7) * 0.55})`;
+            ctx.beginPath();
+            ctx.arc(px, py, Math.max(2.5, 6 - d * 0.55), 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+      } else {
+        const vSpd = Math.hypot(player.vx, player.vy);
+        if (vSpd > 80) {
+          player.angle = Math.atan2(player.vy, player.vx);
+          targetStretch = Math.min(0.24, (vSpd / 1400) * 0.24);
+        }
+      }
+      player.stretch += (targetStretch - player.stretch) * (1 - Math.exp(-20 * dt));
+
+      // Draw stretched player orb + radial slo-mo countdown arc
+      ctx.save();
+      ctx.translate(player.x, player.y);
+
+      if (isSlomo && !unlimitedSlomo) {
+        const energyRatio = Math.max(0, slomoEnergy / maxSlomoDur);
+        ctx.save();
+        ctx.strokeStyle = energyRatio < 0.3 ? 'rgba(255, 110, 90, 0.85)' : 'rgba(85, 214, 255, 0.72)';
+        ctx.lineWidth = 4.5;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.arc(0, 0, player.r + 13, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * energyRatio);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      ctx.rotate(player.angle);
+      ctx.scale(1 + player.stretch, 1 - player.stretch * 0.45);
+      drawSkin(equippedSkin, player.r, false, 1);
+      ctx.restore();
+
+      // Top-centered glowing "SCORE: X", neon-green health bar, and slo-mo timer/cooldown bar
+      displayHp += (hp - displayHp) * (1 - Math.exp(-14 * dt));
+      ctx.save();
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(255,255,255,0.6)';
+      ctx.shadowBlur = 16;
+      ctx.font = `800 44px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(`SCORE: ${score}`, W * 0.5, 42);
+      ctx.restore();
+
+      const barW = 280, barH = 22, barX = W * 0.5 - barW * 0.5, barY = 74;
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      ctx.fillRect(barX, barY, barW, barH);
+      const hpRatio = Math.max(0, Math.min(1, displayHp / maxHp));
+      if (hpRatio > 0) {
+        ctx.save();
+        ctx.fillStyle = hpRatio > 0.3 ? '#66ff66' : '#ff5555';
+        ctx.shadowColor = hpRatio > 0.3 ? 'rgba(102,255,102,0.55)' : 'rgba(255,85,85,0.55)';
+        ctx.shadowBlur = 14;
+        ctx.fillRect(barX, barY, barW * hpRatio, barH);
+        ctx.restore();
+      }
+
+      const smW = 210, smH = 8, smX = W * 0.5 - smW * 0.5, smY = barY + barH + 10;
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      ctx.fillRect(smX, smY, smW, smH);
+
+      if (unlimitedSlomo) {
+        ctx.save();
+        ctx.fillStyle = '#f8f272';
+        ctx.shadowColor = 'rgba(248,242,114,0.65)';
+        ctx.shadowBlur = 10;
+        ctx.fillRect(smX, smY, smW, smH);
+        ctx.restore();
+        ctx.fillStyle = '#f8f272';
+        ctx.font = `700 12px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText('UNLIMITED SLO-MO', W * 0.5, smY + 20);
+      } else if (slomoCooldown > 0) {
+        const cdRatio = 1 - slomoCooldown / maxSlomoCd;
+        ctx.fillStyle = '#ff944d';
+        ctx.fillRect(smX, smY, smW * cdRatio, smH);
+        ctx.fillStyle = 'rgba(255,165,100,0.9)';
+        ctx.font = `700 12px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(`COOLDOWN ${slomoCooldown.toFixed(1)}s`, W * 0.5, smY + 20);
+      } else {
+        const enRatio = Math.max(0, Math.min(1, slomoEnergy / maxSlomoDur));
+        ctx.save();
+        ctx.fillStyle = isSlomo && enRatio < 0.3 ? '#ff6655' : '#55d6ff';
+        ctx.shadowColor = 'rgba(85,214,255,0.55)';
+        ctx.shadowBlur = 10;
+        ctx.fillRect(smX, smY, smW * enRatio, smH);
+        ctx.restore();
+        ctx.fillStyle = isSlomo ? '#55d6ff' : 'rgba(210,235,245,0.75)';
+        ctx.font = `700 12px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(isSlomo ? `SLO-MO ${slomoEnergy.toFixed(1)}s` : 'SLO-MO READY', W * 0.5, smY + 20);
+      }
+
+      // Top-right Chain-Hit Combo HUD Badge
+      if (comboCount >= 2 && comboTimer > 0) {
+        const mult = getComboMultiplier(comboCount);
+        const comboCap = getMaxComboCap();
+        const comboRatio = Math.max(0, Math.min(1, comboTimer / COMBO_WINDOW));
+        const badgeColor = mult >= 2.75 ? '#ff5e7e' : mult >= 1.75 ? '#ffe855' : '#55d6ff';
+        const glowColor = mult >= 2.75 ? 'rgba(255,94,126,0.75)' : mult >= 1.75 ? 'rgba(255,232,85,0.75)' : 'rgba(85,214,255,0.75)';
+        const bx = W - 122, by = 52;
+        const wobble = Math.sin(comboSpring.phase * 14) * 0.045;
+
+        ctx.save();
+        ctx.translate(bx, by);
+        ctx.rotate(wobble);
+        ctx.scale(comboSpring.s, comboSpring.s);
+
+        ctx.fillStyle = badgeColor;
+        ctx.shadowColor = glowColor;
+        ctx.shadowBlur = 16;
+        ctx.font = `900 28px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(`COMBO x${mult.toFixed(2)}`, 0, -4);
+
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.font = `700 12px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(`${comboCount}/${comboCap} MAX COMBO`, 0, 17);
+
+        const cw = 152, ch = 7;
+        ctx.fillStyle = 'rgba(255,255,255,0.14)';
+        ctx.fillRect(-cw * 0.5, 28, cw, ch);
+        ctx.fillStyle = badgeColor;
+        ctx.shadowColor = glowColor;
+        ctx.shadowBlur = 10;
+        ctx.fillRect(-cw * 0.5, 28, cw * comboRatio, ch);
+        ctx.restore();
+      }
+
+      // Tutorial Banner Overlay
+      if (tutorialActive) {
+        const boxW = Math.min(430, W * 0.86), boxH = 166, bx = W * 0.5 - boxW * 0.5, by = 132;
+        ctx.save();
+        ctx.fillStyle = 'rgba(8,8,8,0.88)';
+        ctx.fillRect(bx, by, boxW, boxH);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `600 34px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText('Tutorial', W * 0.5, by + 34);
+
+        const rowY = by + 90;
+        ctx.font = `500 26px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText('Hold the', W * 0.5 - 116, rowY);
+        ctx.fillText('to enter slo-mo', W * 0.5 + 88, rowY);
+
+        const mx = W * 0.5 - 32, my = rowY, mw = 32, mh = 48, mr = 14;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.roundRect(mx - mw / 2, my - mh / 2, mw, mh, mr);
+        ctx.fill();
+
+        ctx.strokeStyle = '#111111';
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        ctx.moveTo(mx - mw / 2, my - 3);
+        ctx.lineTo(mx + mw / 2, my - 3);
+        ctx.moveTo(mx, my - mh / 2);
+        ctx.lineTo(mx, my - 3);
+        ctx.stroke();
+
+        ctx.fillStyle = '#111111';
+        ctx.beginPath();
+        ctx.roundRect(mx - 2.5, my - 17, 5, 10, 2.5);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `600 16px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText('[space to skip]', W * 0.5, by + 142);
+        ctx.restore();
+      }
+
+      ctx.restore();
+    }
+
+    function renderGameOver(dt) {
+      renderAmbientBackground(dt);
+      const cx = W * 0.5, cy = H * 0.5, sc = 0.94;
+
+      ctx.save();
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(255,255,255,0.6)';
+      ctx.shadowBlur = 18 * sc;
+      ctx.font = `800 ${Math.round(52 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(`SCORE: ${score}`, cx, cy - 286 * sc);
+      ctx.restore();
+
+      ctx.save();
+      ctx.fillStyle = '#f8f272';
+      ctx.shadowColor = 'rgba(248,242,114,0.75)';
+      ctx.shadowBlur = 22 * sc;
+      ctx.font = `800 ${Math.round(58 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      const hsText = `HIGHSCORE: ${highScore}`;
+      ctx.fillText(hsText, cx, cy - 216 * sc);
+
+      if (isNewHigh) {
+        const tw = ctx.measureText(hsText).width;
+        ctx.save();
+        ctx.translate(cx + tw * 0.36, cy - 252 * sc);
+        ctx.rotate(0.14);
+        ctx.fillStyle = '#e070ff';
+        ctx.shadowColor = 'rgba(224,112,255,0.75)';
+        ctx.shadowBlur = 12 * sc;
+        ctx.font = `800 ${Math.round(24 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText('NEW!', 0, 0);
+        ctx.restore();
+      }
+      ctx.restore();
+
+      const barW = 340 * sc, barH = 38 * sc, leftX = cx - barW * 0.5;
+      ctx.save();
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(255,255,255,0.45)';
+      ctx.shadowBlur = 10 * sc;
+      ctx.font = `800 ${Math.round(25 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText('score:', leftX - 66 * sc, cy - 154 * sc);
+      ctx.fillText(`+${score}`, leftX + 16 * sc, cy - 154 * sc);
+
+      ctx.fillText('kills:', leftX - 66 * sc, cy - 122 * sc);
+      ctx.fillText(`+${kills}`, leftX + 16 * sc, cy - 122 * sc);
+
+      ctx.fillStyle = maxComboMult > 1 ? '#ffe855' : '#ffffff';
+      ctx.fillText('max combo:', leftX - 66 * sc, cy - 90 * sc);
+      ctx.fillText(`${maxComboMult.toFixed(2)}x`, leftX + 86 * sc, cy - 90 * sc);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `800 ${Math.round(28 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(`+ ${runEarned}`, leftX, cy - 52 * sc);
+
+      ctx.textAlign = 'right';
+      ctx.fillText(`level ${level}`, leftX + barW - 14 * sc, cy - 52 * sc);
+      ctx.restore();
+
+      const barY = cy - 34 * sc;
+      ctx.fillStyle = '#636363';
+      ctx.fillRect(leftX, barY, barW, barH);
+      const xpRatio = Math.max(0, Math.min(1, levelXp / getRequiredXp(level)));
+      if (xpRatio > 0) {
+        ctx.fillStyle = '#f8f272';
+        ctx.fillRect(leftX, barY, barW * xpRatio, barH);
+      }
+
+      ctx.save();
+      ctx.fillStyle = '#f8f272';
+      ctx.shadowColor = 'rgba(248,242,114,0.75)';
+      ctx.shadowBlur = 18 * sc;
+      ctx.font = `800 ${Math.round(48 * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+      ctx.fillText(formatCash(cash), cx, cy + 48 * sc);
+      ctx.restore();
+
+      const bW = 196 * sc, bH = 66 * sc, gap = 20 * sc, topY = cy + 118 * sc, stackH = bH * 2 + gap;
+      const grad = ctx.createLinearGradient(cx, topY - 12 * sc, cx, topY + stackH + 12 * sc);
+      grad.addColorStop(0, 'rgba(28,28,28,0)');
+      grad.addColorStop(0.15, 'rgba(34,34,34,0.78)');
+      grad.addColorStop(0.5, 'rgba(26,26,26,0.85)');
+      grad.addColorStop(0.85, 'rgba(34,34,34,0.78)');
+      grad.addColorStop(1, 'rgba(28,28,28,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(cx - bW / 2, topY - 12 * sc, bW, stackH + 24 * sc);
+
+      [['PLAY', 40], ['SHOP', 38]].forEach(([label, fs], i) => {
+        const bcy = topY + i * (bH + gap) + bH * 0.5;
+        const sp = goSprings[i];
+        const hitPad = sp.hover > 0.1 ? 1.16 : 1.0;
+        const hovered = Math.abs(ptr.x - cx) <= bW * 0.5 * hitPad && Math.abs(ptr.y - bcy) <= bH * 0.5 * hitPad;
+        stepArcadeSpring(sp, hovered, 1.26, dt);
+
+        const waveX = Math.sin(sp.phase * 15) * 11 * sc * sp.hover;
+        const tilt = Math.sin(sp.phase * 13) * 0.085 * sp.hover;
+
+        ctx.save();
+        ctx.translate(cx + waveX, bcy);
+        ctx.rotate(tilt);
+        ctx.scale(sp.s, sp.s);
+        ctx.shadowColor = sp.hover > 0.1 ? `rgba(255,255,255,${0.55 * sp.hover})` : 'rgba(0,0,0,0.65)';
+        ctx.shadowBlur = (10 + 16 * sp.hover) * sc;
+        ctx.shadowOffsetY = 3 * sc * (1 - sp.hover);
+        ctx.fillStyle = '#f8f8f8';
+        ctx.fillRect(-bW / 2, -bH / 2, bW, bH);
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.fillStyle = '#1b1b1b';
+        ctx.font = `800 ${Math.round(fs * sc)}px 'Segoe UI', Roboto, Arial, sans-serif`;
+        ctx.fillText(label, 0, bH * 0.03);
+        ctx.restore();
+      });
+    }
+
+    // Main requestAnimationFrame loop with clamped Delta Time (Math.min(0.033, ...))
+    function loop(now) {
+      const dt = lastTime ? Math.min(0.033, (now - lastTime) / 1000) : 0.016;
+      lastTime = now;
+      elapsed += dt;
+
+      if (fadeDir !== 0) {
+        fade = Math.max(0, Math.min(1, fade + fadeDir * dt * 3.4));
+        if (fade >= 1 && fadeDir === 1) {
+          state = nextState;
+          if (state === 'GAME') startGame();
+          else if (state === 'UPGRADES') triggerUpgradeScreenEnter();
+          fadeDir = -1;
+        } else if (fade <= 0 && fadeDir === -1) {
+          fadeDir = 0;
+        }
+      }
+
+      if (state === 'MENU') {
+        renderMenu(dt);
+      } else if (state === 'SKINS') {
+        renderSkins(dt);
+      } else if (state === 'UPGRADES') {
+        renderUpgrades(dt);
+      } else if (state === 'GAMEOVER') {
+        renderGameOver(dt);
+      } else {
+        renderGame(dt);
+      }
+
+      if (fade > 0) {
+        ctx.fillStyle = `rgba(5,5,5,${fade})`;
+        ctx.fillRect(0, 0, W, H);
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    window.onload = function () {
+      requestAnimationFrame(loop);
+    };
+  </script>
+</body>
+</html>
